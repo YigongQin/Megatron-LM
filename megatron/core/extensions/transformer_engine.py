@@ -83,6 +83,20 @@ except ImportError:
         te = MagicMock()
         HAVE_TE = False
 
+# FA4 detection. When flash-attn-4 is importable, this worker is in the m-inf-fa4 venv
+# (NRL_MCORE_FA4=1). FA4's adaptive split-K is non-deterministic w.r.t. batch size, so we
+# force num_splits=1 unconditionally on TE attention whenever FA4 is available — this is
+# orthogonal to BATCH_INVARIANT and the per-kernel BI knob (NRL_BI_KERNELS). FA4 inference
+# generation in attention.py already pins num_splits=1; this mirrors that for train +
+# logprob recompute, so generation/training/logprob attention all stay deterministic
+# regardless of BI flag for FA4 builds.
+try:
+    from flash_attn.cute import flash_attn_varlen_func as _fa4_probe  # noqa: F401
+
+    HAVE_FA4 = True
+except ImportError:
+    HAVE_FA4 = False
+
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 
 
@@ -1614,10 +1628,17 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         self.config = config
         self.te_forward_mask_type = False
         self.qkv_format: str = "sbhd"
-        # Default to 1 split when batch-invariant mode is enabled, unless explicitly overridden
-        self.num_splits: Optional[int] = (
-            1 if (num_splits is None and self.config.batch_invariant_mode) else num_splits
-        )
+        # Debug-only strict mode: require FA4 and force num_splits=1.
+        # Hard-fail if FA4 is missing so misconfigured runs surface immediately rather than
+        # silently using non-deterministic adaptive split-K. Revisit this guard once FA4 is
+        # not the target backend for these experiments.
+        if not HAVE_FA4:
+            raise RuntimeError(
+                "TEDotProductAttention requires FlashAttention 4 (`flash_attn.cute`) in "
+                "this build, but the import failed. Install flash-attn-4 or run with the "
+                "m-inf-fa4 venv (NRL_MCORE_FA4=1)."
+            )
+        self.num_splits: Optional[int] = 1
 
         if self.config.apply_query_key_layer_scaling != bool(
             int(os.getenv("NVTE_APPLY_QK_LAYER_SCALING", "0"))

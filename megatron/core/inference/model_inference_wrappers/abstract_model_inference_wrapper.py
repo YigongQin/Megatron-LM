@@ -64,8 +64,11 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         if self.config.fp8 is not None and self.config.transformer_impl != "inference_optimized":
             self.model = prepare_model_for_fp8_inference(self.model)
-
-        # TODO(ksanthanam): Add support for fp4
+        elif self.config.fp4 is not None:
+            # Same TE linear padding wrapper as FP8 inference (fp8_utils.padded_forward also applies
+            # when modules run in FP4 / fp8_autocast). Without this, TE assert_dim_for_fp8_exec can fail
+            # on arbitrary packed token counts (e.g. total tokens not divisible by 8).
+            self.model = prepare_model_for_fp8_inference(self.model)
 
     def prep_model_for_inference(self):
         """A utility function for preparing model for inference

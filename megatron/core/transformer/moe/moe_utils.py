@@ -2,6 +2,7 @@
 
 import functools
 import math
+import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
@@ -51,6 +52,60 @@ else:
         fused_unpermute,
         te_general_gemm,
     ) = (None, None, None, None, None, None, None, None, None, None)
+
+
+def _use_deterministic_moe_paths() -> bool:
+    """NeMo-RL MoE-only determinism knob (no global ``torch.use_deterministic_algorithms``).
+
+    Opt-in only: set ``NRL_FIXED_ORDER_MOE_COMBINE=1`` (default off). Dense models never
+    call these code paths. When enabled, selects in ``moe_utils`` only:
+    - ``unpermute``: fixed-order ``[T, max_slots, H].sum(1)`` instead of ``scatter_add_``
+    - ``topk_softmax_with_capacity``: ``index_put_`` instead of ``scatter`` for routing maps
+
+    Megatron ``--deterministic-mode`` still sets the global torch flag separately.
+    """
+    return os.environ.get("NRL_FIXED_ORDER_MOE_COMBINE", "0") == "1"
+
+
+def _unpermute_fixed_order_combine(
+    permuted_tokens: torch.Tensor,
+    sorted_indices: torch.Tensor,
+    restore_shape: torch.Size,
+) -> torch.Tensor:
+    """Sum expert outputs per token in stable (permute) order via [T, max_slots, H].sum(1).
+
+    Avoids atomic ``scatter_add_`` / ``index_add_``. Works for standard top-k routing and
+    for decode ``drop_and_pad`` (variable rows per token; ``max_slots`` from group sizes).
+    """
+    num_tokens, hidden = restore_shape
+    num_permuted = permuted_tokens.size(0)
+    if num_permuted == 0:
+        return torch.zeros(restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device)
+
+    sort_perm = torch.argsort(sorted_indices, stable=True)
+    dest = sorted_indices[sort_perm]
+    vals = permuted_tokens[sort_perm]
+
+    seq = torch.arange(num_permuted, device=permuted_tokens.device, dtype=torch.long)
+    if num_permuted > 1:
+        change = dest.new_ones(num_permuted, dtype=torch.bool)
+        change[1:] = dest[1:] != dest[:-1]
+    else:
+        change = dest.new_ones(1, dtype=torch.bool)
+    group_id = change.long().cumsum(0) - 1
+    num_groups = int(group_id[-1].item()) + 1
+    group_sizes = torch.bincount(group_id, minlength=num_groups)
+    starts = torch.zeros(num_groups, dtype=torch.long, device=permuted_tokens.device)
+    if num_groups > 1:
+        starts[1:] = group_sizes.cumsum(0)[:-1]
+    slot = seq - starts[group_id]
+    max_slots = int(group_sizes.max().item())
+
+    contrib = torch.zeros(
+        num_tokens, max_slots, hidden, dtype=permuted_tokens.dtype, device=permuted_tokens.device
+    )
+    contrib[dest, slot] = vals
+    return contrib.sum(dim=1)
 
 
 def switch_load_balancing_loss_func(
@@ -510,24 +565,20 @@ def unpermute(
         # allocation.
         permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
 
-    # Create an output tensor filled with zeros
-    output_tokens = torch.zeros(
-        restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
-    )
-    if torch.are_deterministic_algorithms_enabled():
-        # Use index_add which is deterministic when deterministic algorithms are enabled
-        # and is CUDA graph compatible
+    if _use_deterministic_moe_paths():
+        output_tokens = _unpermute_fixed_order_combine(
+            permuted_tokens, sorted_indices, restore_shape
+        )
+    else:
         output_tokens = torch.zeros(
             restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
         )
-        # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
-        # and is CUDA graph compatible unlike scatter_add
-        output_tokens.index_add_(0, sorted_indices, permuted_tokens)
-    else:
-        # Scatter add the permuted_input back to the original positions
-        output_tokens.scatter_add_(
-            0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
-        )
+        if torch.are_deterministic_algorithms_enabled():
+            output_tokens.index_add_(0, sorted_indices, permuted_tokens)
+        else:
+            output_tokens.scatter_add_(
+                0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
+            )
     return output_tokens.to(dtype=input_dtype)
 
 

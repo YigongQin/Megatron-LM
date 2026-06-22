@@ -737,7 +737,18 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
         """
-        hidden_states, context = self._forward_attention(*args, **kwargs)
+        if self.config.fp8:
+            from megatron.core.extensions.transformer_engine import HAVE_TE
+
+            if HAVE_TE:
+                from transformer_engine.pytorch.fp8 import fp8_autocast
+
+                with fp8_autocast(enabled=False):
+                    hidden_states, context = self._forward_attention(*args, **kwargs)
+            else:
+                hidden_states, context = self._forward_attention(*args, **kwargs)
+        else:
+            hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
             kwargs.get("inference_context", None),

@@ -81,6 +81,10 @@ if not HAVE_FA3:
     except ImportError as e:
         pass
 
+# FA4 (flash-attn-4) varlen kernel. Used as a batch-invariant-compatible fallback for the
+# inference generation path (flash_decode_and_prefill) when FA3 is not installed but FA4 is.
+# FA4 has no flash_attn_with_kvcache equivalent, so paged decode is emulated via varlen with
+# q reshaped to (total_q, nheads, headdim) and cu_seqlens_q = [0, 1, ..., B].
 try:
     from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
 

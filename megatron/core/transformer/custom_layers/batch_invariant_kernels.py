@@ -7,9 +7,10 @@ import contextlib
 import importlib
 import importlib.util
 import logging
+import os
 from collections import namedtuple
 from collections.abc import Callable
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import torch
 
@@ -33,10 +34,81 @@ __all__ = [
     "is_batch_invariant_mode_enabled",
     "disable_batch_invariant_mode",
     "enable_batch_invariant_mode",
+    "get_enabled_batch_invariant_kernels",
 ]
 
 
 _LOGGER = logging.getLogger(__name__)
+
+# Per-kernel BI knob. Set NRL_BI_KERNELS to a comma-separated list of
+# categories to selectively enable (debug-only). Default = "all".
+# Valid categories:
+#   mm                       - aten::mm + aten::addmm   (Triton persistent matmul)
+#   log_softmax              - aten::_log_softmax        (Triton)
+#   mean                     - aten::mean.dim            (Triton)
+#   te_gemm                  - TE general_gemm replaced by Triton persistent matmul
+#                              (Linear / LayerNormLinear / Megatron wrapper)
+#   te_rmsnorm               - TE RMSNorm patches (class + module-level helpers)
+#   te_gemm_cublas_pinned    - OPT-IN alternative to te_gemm: keep TE's native cuBLASLt
+#                              general_gemm but shrink the cuBLAS workspace to ~0 bytes so
+#                              cuBLASLt heuristics are forced to pick workspace-free
+#                              algorithms (splitK=1, reduction=NONE by construction).
+#                              Mutually exclusive with te_gemm (Triton wins if both set).
+#                              Not included in "all"; must be enumerated explicitly.
+#                              NOTE: this does not literally pin one kernel across all M;
+#                              tile_id can still vary. Verify with CUBLASLT_LOG_LEVEL=5
+#                              that the selected algo is stable across batch sizes.
+#
+# Note: attention num_splits is no longer a knob category. With the FA4-strict guard in
+# megatron.core.extensions.transformer_engine.TEDotProductAttention, attention is forced to
+# num_splits=1 unconditionally on FA4 builds (and the class hard-errors when FA4 is absent),
+# so there is nothing to A/B test for attention here.
+#
+# Examples:
+#   NRL_BI_KERNELS=all                                                    # default; the 5 stable categories below
+#   NRL_BI_KERNELS=mm,te_gemm,te_rmsnorm                                  # only matmul-family patches
+#   NRL_BI_KERNELS=mm,log_softmax,mean,te_gemm,te_rmsnorm                 # equivalent to "all"
+#   NRL_BI_KERNELS=mm,log_softmax,mean,te_rmsnorm,te_gemm_cublas_pinned   # cuBLAS variant of te_gemm (no Triton)
+_VALID_BI_KERNELS: Set[str] = {
+    "mm",
+    "log_softmax",
+    "mean",
+    "te_gemm",
+    "te_rmsnorm",
+    "te_gemm_cublas_pinned",
+}
+
+# Subset returned when NRL_BI_KERNELS is unset or "all". Keeps backward-compat
+# (no auto-enabling of the opt-in cuBLAS variant) so default runs continue to
+# go through the Triton persistent matmul path for te_gemm.
+_DEFAULT_BI_KERNELS: Set[str] = {
+    "mm",
+    "log_softmax",
+    "mean",
+    "te_gemm",
+    "te_rmsnorm",
+}
+
+
+def get_enabled_batch_invariant_kernels() -> Set[str]:
+    """Parse NRL_BI_KERNELS env var. Returns set of enabled kernel categories.
+
+    "all" (default) or empty returns `_DEFAULT_BI_KERNELS` (the 5 stable
+    categories; not the opt-in cuBLAS variant). Unknown categories are warned
+    and dropped.
+    """
+    raw = os.environ.get("NRL_BI_KERNELS", "all").strip().lower()
+    if raw == "" or raw == "all":
+        return set(_DEFAULT_BI_KERNELS)
+    requested = {p.strip() for p in raw.split(",") if p.strip()}
+    unknown = requested - _VALID_BI_KERNELS
+    if unknown:
+        _LOGGER.warning(
+            "NRL_BI_KERNELS contains unknown categories %s; valid=%s",
+            sorted(unknown),
+            sorted(_VALID_BI_KERNELS),
+        )
+    return requested & _VALID_BI_KERNELS
 
 
 def _matmul_launch_metadata(
@@ -525,6 +597,12 @@ _TE_RMSNORM_ORIG_FWD = None
 _MEG_TE_GENERAL_GEMM_ORIG = None
 _TE_RMSNORM_FUNC_ORIGS: Dict[str, Any] = {}
 _TE_GEMM_FUNC_ORIGS: Dict[str, Any] = {}
+# Original handle for TE's cuBLAS workspace sizer (te_gemm_cublas_pinned only).
+_TE_CUBLAS_WS_SIZE_FN_ORIG: Optional[Callable[[], int]] = None
+# Floor for the patched workspace size (bytes). TE's cublaslt_gemm.cu carves
+# 4 bytes off the workspace for NVFP4 alpha scratch and asserts >=4, so we use 4
+# as a near-zero value that is safe across precisions.
+_TE_CUBLAS_WS_PINNED_BYTES: int = 4
 
 
 def _import_module_if_available(name: str):
@@ -534,88 +612,108 @@ def _import_module_if_available(name: str):
     return importlib.import_module(name)
 
 
-def _te_patch_for_batch_invariant():
+def _te_patch_for_batch_invariant(enabled: Optional[Set[str]] = None):
     """Patch Transformer Engine modules to use batch-invariant GEMM and RMSNorm.
 
     This monkey-patches TE's GEMM and RMSNorm entry points to dispatch to the
     batch-invariant implementations when batch-invariant mode is enabled.
     Safe no-op if TE is unavailable.
+
+    Per-kernel gating via `enabled` (see `get_enabled_batch_invariant_kernels`).
+    GEMM patches only fire when "te_gemm" is in `enabled`, RMSNorm patches only
+    when "te_rmsnorm" is in `enabled`. If `enabled` is None, both are applied
+    (backward-compat for any external callers).
+
+    Note: `te_gemm_cublas_pinned` does NOT patch general_gemm here — it leaves
+    TE's native cuBLASLt path in place and only shrinks the workspace (applied
+    separately in `enable_batch_invariant_mode` via
+    `_shrink_te_cublas_workspace_for_invariance`).
     """
     global _TE_GENERAL_GEMM_ORIG, _TE_RMSNORM_ORIG_FWD, _MEG_TE_GENERAL_GEMM_ORIG
+    if enabled is None:
+        enabled = {"te_gemm", "te_rmsnorm"}
+    if "te_gemm" not in enabled and "te_rmsnorm" not in enabled:
+        return
     import transformer_engine.pytorch as te
     import transformer_engine.pytorch.cpp_extensions as te_cpp
 
-    # Patch general_gemm once
-    if _TE_GENERAL_GEMM_ORIG is None and hasattr(te_cpp, "general_gemm"):
-        _TE_GENERAL_GEMM_ORIG = te_cpp.general_gemm
-        te_cpp.general_gemm = _te_general_gemm_patched
+    if "te_gemm" in enabled:
+        # Patch general_gemm once
+        if _TE_GENERAL_GEMM_ORIG is None and hasattr(te_cpp, "general_gemm"):
+            _TE_GENERAL_GEMM_ORIG = te_cpp.general_gemm
+            te_cpp.general_gemm = _te_general_gemm_patched
 
-    # Also patch the symbol imported inside TE's module.linear
-    # (from ..cpp_extensions import general_gemm)
-    import transformer_engine.pytorch.module.linear as te_linear_mod
+        # Also patch the symbol imported inside TE's module.linear
+        # (from ..cpp_extensions import general_gemm)
+        import transformer_engine.pytorch.module.linear as te_linear_mod
 
-    if hasattr(te_linear_mod, "general_gemm"):
-        if "module.linear.general_gemm" not in _TE_GEMM_FUNC_ORIGS:
-            _TE_GEMM_FUNC_ORIGS["module.linear.general_gemm"] = te_linear_mod.general_gemm
-            te_linear_mod.general_gemm = _te_general_gemm_patched
+        if hasattr(te_linear_mod, "general_gemm"):
+            if "module.linear.general_gemm" not in _TE_GEMM_FUNC_ORIGS:
+                _TE_GEMM_FUNC_ORIGS["module.linear.general_gemm"] = te_linear_mod.general_gemm
+                te_linear_mod.general_gemm = _te_general_gemm_patched
 
-    # Also patch the symbol imported inside TE's module.layernorm_linear
-    import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod
+        # Also patch the symbol imported inside TE's module.layernorm_linear
+        import transformer_engine.pytorch.module.layernorm_linear as te_layernorm_linear_mod
 
-    if hasattr(te_layernorm_linear_mod, "general_gemm"):
-        if "module.layernorm_linear.general_gemm" not in _TE_GEMM_FUNC_ORIGS:
-            _TE_GEMM_FUNC_ORIGS["module.layernorm_linear.general_gemm"] = (
-                te_layernorm_linear_mod.general_gemm
-            )
-            te_layernorm_linear_mod.general_gemm = _te_general_gemm_patched
+        if hasattr(te_layernorm_linear_mod, "general_gemm"):
+            if "module.layernorm_linear.general_gemm" not in _TE_GEMM_FUNC_ORIGS:
+                _TE_GEMM_FUNC_ORIGS["module.layernorm_linear.general_gemm"] = (
+                    te_layernorm_linear_mod.general_gemm
+                )
+                te_layernorm_linear_mod.general_gemm = _te_general_gemm_patched
 
-    # Also patch the symbol imported into Megatron's TE wrapper module
-    import megatron.core.extensions.transformer_engine as meg_te
+        # Also patch the symbol imported into Megatron's TE wrapper module
+        import megatron.core.extensions.transformer_engine as meg_te
 
-    if _MEG_TE_GENERAL_GEMM_ORIG is None and hasattr(meg_te, "general_gemm"):
-        _MEG_TE_GENERAL_GEMM_ORIG = meg_te.general_gemm
-        meg_te.general_gemm = _te_general_gemm_patched
+        if _MEG_TE_GENERAL_GEMM_ORIG is None and hasattr(meg_te, "general_gemm"):
+            _MEG_TE_GENERAL_GEMM_ORIG = meg_te.general_gemm
+            meg_te.general_gemm = _te_general_gemm_patched
 
-    # Patch RMSNorm.forward once (class may be on te or te.pytorch)
-    rms_cls = getattr(te, "RMSNorm", None)
-    if rms_cls is None:
-        rms_cls = getattr(te, "pytorch", None)
-        rms_cls = getattr(rms_cls, "RMSNorm", None)
-    if rms_cls is not None and _TE_RMSNORM_ORIG_FWD is None and hasattr(rms_cls, "forward"):
-        _TE_RMSNORM_ORIG_FWD = rms_cls.forward
-        rms_cls.forward = _te_rmsnorm_forward_patched
+    if "te_rmsnorm" in enabled:
+        # Patch RMSNorm.forward once (class may be on te or te.pytorch)
+        rms_cls = getattr(te, "RMSNorm", None)
+        if rms_cls is None:
+            rms_cls = getattr(te, "pytorch", None)
+            rms_cls = getattr(rms_cls, "RMSNorm", None)
+        if rms_cls is not None and _TE_RMSNORM_ORIG_FWD is None and hasattr(rms_cls, "forward"):
+            _TE_RMSNORM_ORIG_FWD = rms_cls.forward
+            rms_cls.forward = _te_rmsnorm_forward_patched
 
-    # Patch TE module-level RMSNorm functions used by fused LayerNormLinear
-    import transformer_engine.pytorch.module.layernorm as te_layernorm_mod
+        # Patch TE module-level RMSNorm functions used by fused LayerNormLinear
+        import transformer_engine.pytorch.module.layernorm as te_layernorm_mod
 
-    def _make_rmsnorm_patched(orig_func):
-        # Module-level helpers (e.g. transformer_engine.pytorch.module.layernorm.rmsnorm)
-        # do not go through the RMSNorm class, so we also wrap those functions here.
-        def _patched(*args, **kwargs):
-            # If batch-invariant mode is off, use original
-            if not is_batch_invariant_mode_enabled():
-                return orig_func(*args, **kwargs)
+        def _make_rmsnorm_patched(orig_func):
+            # Module-level helpers (e.g. transformer_engine.pytorch.module.layernorm.rmsnorm)
+            # do not go through the RMSNorm class, so we also wrap those functions here.
+            def _patched(*args, **kwargs):
+                # If batch-invariant mode is off, use original
+                if not is_batch_invariant_mode_enabled():
+                    return orig_func(*args, **kwargs)
 
-            # Extract x, weight, eps from args/kwargs per TE signatures
-            x = args[0] if len(args) > 0 else kwargs.get("x")
-            weight = args[1] if len(args) > 1 else kwargs.get("weight")
-            eps = (args[2] if len(args) > 2 else None) if "eps" not in kwargs else kwargs.get("eps")
-            if eps is None:
-                eps = 1e-5
-            if x is None or weight is None:
-                return orig_func(*args, **kwargs)
+                # Extract x, weight, eps from args/kwargs per TE signatures
+                x = args[0] if len(args) > 0 else kwargs.get("x")
+                weight = args[1] if len(args) > 1 else kwargs.get("weight")
+                eps = (
+                    (args[2] if len(args) > 2 else None)
+                    if "eps" not in kwargs
+                    else kwargs.get("eps")
+                )
+                if eps is None:
+                    eps = 1e-5
+                if x is None or weight is None:
+                    return orig_func(*args, **kwargs)
 
-            y = rmsnorm_batch_invariant(x, weight, float(eps))
-            # Match TE behavior: cast output to parameter dtype
-            return y.to(weight.dtype)
+                y = rmsnorm_batch_invariant(x, weight, float(eps))
+                # Match TE behavior: cast output to parameter dtype
+                return y.to(weight.dtype)
 
-        return _patched
+            return _patched
 
-    for name in ("rmsnorm", "rmsnorm_forward", "rmsnorm_fwd"):
-        if hasattr(te_layernorm_mod, name) and name not in _TE_RMSNORM_FUNC_ORIGS:
-            orig = getattr(te_layernorm_mod, name)
-            _TE_RMSNORM_FUNC_ORIGS[name] = orig
-            setattr(te_layernorm_mod, name, _make_rmsnorm_patched(orig))
+        for name in ("rmsnorm", "rmsnorm_forward", "rmsnorm_fwd"):
+            if hasattr(te_layernorm_mod, name) and name not in _TE_RMSNORM_FUNC_ORIGS:
+                orig = getattr(te_layernorm_mod, name)
+                _TE_RMSNORM_FUNC_ORIGS[name] = orig
+                setattr(te_layernorm_mod, name, _make_rmsnorm_patched(orig))
 
 
 def _te_unpatch_for_batch_invariant():
@@ -689,6 +787,87 @@ def _te_unpatch_for_batch_invariant():
         _TE_GEMM_FUNC_ORIGS.pop(key, None)
     else:
         _TE_GEMM_FUNC_ORIGS.pop(key, None)
+
+
+def _shrink_te_cublas_workspace_for_invariance(
+    target_bytes: int = _TE_CUBLAS_WS_PINNED_BYTES,
+) -> None:
+    """Monkey-patch TE's cuBLAS workspace sizer to a near-zero value.
+
+    Rationale: cuBLASLt only selects split-K + reduction algorithms when a
+    workspace is available. By starving the workspace, the dispatcher is forced
+    onto workspace-free algorithms which are by construction `SPLITK_NUM=1`
+    and `REDUCTION_SCHEME=NONE` — both of which are necessary (but not
+    sufficient) conditions for batch invariance through cuBLASLt.
+
+    This does NOT literally pin one algorithm across all (M,N,K); cuBLASLt can
+    still vary `tile_id` with M. Verify empirically with `CUBLASLT_LOG_LEVEL=5`
+    that the selected algo is stable across the batch sizes you care about. If
+    not, escalate to per-shape padding (round M up to the dominant tile size)
+    or to a C++ extension that calls `cublasLtMatmul` with a manually built
+    `cublasLtMatmulAlgo_t` and `cublasLtMatmulAlgoCheck` per call.
+
+    `target_bytes` defaults to `_TE_CUBLAS_WS_PINNED_BYTES` (4 bytes) which is
+    the minimum that satisfies the NVFP4 alpha-scratch guard in TE's
+    `cublaslt_gemm.cu`. Safe across BF16/FP16/FP32/FP8/NVFP4 paths.
+
+    Also clears the `get_cublas_workspace` lru_cache so any already-cached
+    full-size workspace tensors are dropped on the next allocation.
+    """
+    global _TE_CUBLAS_WS_SIZE_FN_ORIG
+    if _TE_CUBLAS_WS_SIZE_FN_ORIG is not None:
+        return
+    te_gemm_mod = _import_module_if_available("transformer_engine.pytorch.cpp_extensions.gemm")
+    if te_gemm_mod is None:
+        _LOGGER.warning(
+            "te_gemm_cublas_pinned requested but transformer_engine.pytorch.cpp_extensions.gemm "
+            "is not importable; skipping workspace shrink."
+        )
+        return
+    if not hasattr(te_gemm_mod, "get_cublas_workspace_size_bytes"):
+        _LOGGER.warning(
+            "te_gemm_cublas_pinned: TE gemm module has no get_cublas_workspace_size_bytes "
+            "(TE version mismatch?); skipping workspace shrink."
+        )
+        return
+    _TE_CUBLAS_WS_SIZE_FN_ORIG = te_gemm_mod.get_cublas_workspace_size_bytes
+    te_gemm_mod.get_cublas_workspace_size_bytes = lambda: int(target_bytes)
+    ws_fn = getattr(te_gemm_mod, "get_cublas_workspace", None)
+    if ws_fn is not None and hasattr(ws_fn, "cache_clear"):
+        try:
+            ws_fn.cache_clear()
+        except Exception:  # pylint: disable=broad-except
+            pass
+    _LOGGER.warning(
+        "[batch_invariant] shrunk TE cuBLAS workspace to %d bytes (te_gemm_cublas_pinned). "
+        "Set CUBLASLT_LOG_LEVEL=5 to verify cuBLASLt picks a stable algo across batch sizes.",
+        target_bytes,
+    )
+
+
+def _restore_te_cublas_workspace() -> None:
+    """Undo `_shrink_te_cublas_workspace_for_invariance`.
+
+    Restores TE's original `get_cublas_workspace_size_bytes` and clears the
+    `get_cublas_workspace` cache so the next allocation reverts to the full
+    size (32 MiB on Hopper, 4 MiB elsewhere).
+    """
+    global _TE_CUBLAS_WS_SIZE_FN_ORIG
+    if _TE_CUBLAS_WS_SIZE_FN_ORIG is None:
+        return
+    te_gemm_mod = _import_module_if_available("transformer_engine.pytorch.cpp_extensions.gemm")
+    if te_gemm_mod is None:
+        _TE_CUBLAS_WS_SIZE_FN_ORIG = None
+        return
+    if hasattr(te_gemm_mod, "get_cublas_workspace_size_bytes"):
+        te_gemm_mod.get_cublas_workspace_size_bytes = _TE_CUBLAS_WS_SIZE_FN_ORIG
+    ws_fn = getattr(te_gemm_mod, "get_cublas_workspace", None)
+    if ws_fn is not None and hasattr(ws_fn, "cache_clear"):
+        try:
+            ws_fn.cache_clear()
+        except Exception:  # pylint: disable=broad-except
+            pass
+    _TE_CUBLAS_WS_SIZE_FN_ORIG = None
 
 
 def _extract_te_gemm_args(args: tuple, kwargs: Dict[str, Any]):
@@ -963,19 +1142,52 @@ def is_batch_invariant_mode_enabled():
 
 
 def enable_batch_invariant_mode():
-    """Enable global batch-invariant mode and patch Aten/TE kernels."""
+    """Enable global batch-invariant mode and patch Aten/TE kernels.
+
+    Honors `NRL_BI_KERNELS` for per-category gating (see module docstring).
+    """
     global _batch_invariant_MODE, _batch_invariant_LIB
     if _batch_invariant_MODE:
         return
+    enabled = get_enabled_batch_invariant_kernels()
+
+    # te_gemm and te_gemm_cublas_pinned are A/B alternatives for TE's
+    # general_gemm and cannot both be active: te_gemm replaces general_gemm
+    # with the Triton persistent matmul, while te_gemm_cublas_pinned keeps
+    # TE's native cuBLASLt path and only shrinks the workspace. If both are
+    # requested, drop the cuBLAS variant (Triton wins) and warn loudly so the
+    # user sees which side of the A/B they actually got.
+    if "te_gemm" in enabled and "te_gemm_cublas_pinned" in enabled:
+        _LOGGER.warning(
+            "[batch_invariant] te_gemm and te_gemm_cublas_pinned are mutually exclusive; "
+            "te_gemm (Triton persistent matmul) wins. Dropping te_gemm_cublas_pinned."
+        )
+        enabled = enabled - {"te_gemm_cublas_pinned"}
+
+    _LOGGER.warning(
+        "[batch_invariant] enabling kernels: %s (NRL_BI_KERNELS=%s)",
+        sorted(enabled),
+        os.environ.get("NRL_BI_KERNELS", "all"),
+    )
     dispatch_key = getattr(torch.accelerator.current_accelerator(), "type", "cpu").upper()
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
-    _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
-    _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
-    _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
-    _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
+    if "mm" in enabled:
+        _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
+    if "log_softmax" in enabled:
+        _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
+    if "mean" in enabled:
+        _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
     # Also patch Transformer Engine kernels when available
-    _te_patch_for_batch_invariant()
+    _te_patch_for_batch_invariant(enabled)
+    # Tier-1 cuBLAS variant: keep TE's native general_gemm but shrink its
+    # cuBLAS workspace to ~0 bytes. Must come after _te_patch_for_batch_invariant
+    # so we don't accidentally shrink the workspace under a Triton-replaced
+    # general_gemm (the mutual-exclusion check above already drops the cuBLAS
+    # category in that case).
+    if "te_gemm_cublas_pinned" in enabled:
+        _shrink_te_cublas_workspace_for_invariance()
 
 
 def disable_batch_invariant_mode():
@@ -987,6 +1199,9 @@ def disable_batch_invariant_mode():
     _batch_invariant_LIB = None
     # Restore Transformer Engine kernels if previously patched
     _te_unpatch_for_batch_invariant()
+    # Restore TE cuBLAS workspace if shrunk (no-op if te_gemm_cublas_pinned
+    # was not active).
+    _restore_te_cublas_workspace()
 
 
 @contextlib.contextmanager
