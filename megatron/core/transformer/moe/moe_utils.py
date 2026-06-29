@@ -1,12 +1,29 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
+import logging
 import math
 import os
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import torch
+
+_NRL_LOGGER = logging.getLogger(__name__)
+# One-shot guard so the unpermute-combine-path diagnostic surfaces which combine
+# branch actually executes (fused vs fixed-order vs scatter_add) without flooding.
+_NRL_UNPERMUTE_PATH_SEEN: set[str] = set()
+
+
+def _nrl_log_unpermute_path(path: str) -> None:
+    if path not in _NRL_UNPERMUTE_PATH_SEEN:
+        _NRL_UNPERMUTE_PATH_SEEN.add(path)
+        _NRL_LOGGER.warning(
+            "[moe-combine] unpermute executed via '%s' "
+            "(NRL_FIXED_ORDER_MOE_COMBINE=%s)",
+            path,
+            os.environ.get("NRL_FIXED_ORDER_MOE_COMBINE", "0"),
+        )
 
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -74,8 +91,9 @@ def _unpermute_fixed_order_combine(
 ) -> torch.Tensor:
     """Sum expert outputs per token in stable (permute) order via [T, max_slots, H].sum(1).
 
-    Avoids atomic ``scatter_add_`` / ``index_add_``. Works for standard top-k routing and
-    for decode ``drop_and_pad`` (variable rows per token; ``max_slots`` from group sizes).
+    Avoids atomic ``scatter_add_`` / ``index_add_``. Uses the same accumulation dtype as
+    ``scatter_add_`` (``permuted_tokens.dtype`` after gating weights). Works for standard
+    top-k routing and decode ``drop_and_pad`` (variable rows per token).
     """
     num_tokens, hidden = restore_shape
     num_permuted = permuted_tokens.size(0)
@@ -525,6 +543,7 @@ def unpermute(
     if fused:
         if not HAVE_TE or fused_unpermute is None:
             raise ValueError("fused_unpermute is not available. Please install TE >= 2.1.0.")
+        _nrl_log_unpermute_path("fused_unpermute")
         extra_kwargs = {}
         if is_te_min_version("2.12.0"):
             extra_kwargs["pad_offsets"] = pad_offsets
@@ -566,6 +585,7 @@ def unpermute(
         permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
 
     if _use_deterministic_moe_paths():
+        _nrl_log_unpermute_path("fixed_order_combine")
         output_tokens = _unpermute_fixed_order_combine(
             permuted_tokens, sorted_indices, restore_shape
         )
@@ -574,8 +594,10 @@ def unpermute(
             restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
         )
         if torch.are_deterministic_algorithms_enabled():
+            _nrl_log_unpermute_path("index_add")
             output_tokens.index_add_(0, sorted_indices, permuted_tokens)
         else:
+            _nrl_log_unpermute_path("scatter_add")
             output_tokens.scatter_add_(
                 0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens
             )

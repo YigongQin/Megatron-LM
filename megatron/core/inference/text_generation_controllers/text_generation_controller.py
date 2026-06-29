@@ -1661,16 +1661,29 @@ class TextGenerationController:
         )
         finished_request_ids = context.request_ids[finished_idxs]
 
-        # Save block IDs for finished requests before update_requests releases them.
-        # Needed for per-block routing reconstruction in the engine.
-        finished_routing_block_ids = {}
-        if context.kv_block_allocator.block_routing and finished_idxs.numel() > 0:
+        # Reconstruct per-block MoE routing for finished requests *before*
+        # update_requests runs: update_requests releases finished blocks and
+        # reallocates them to resuming/new requests, and reallocation pops the
+        # per-block routing store. Under KV-cache pressure (heavy eviction), a
+        # finished request's blocks can be reused within this same step, so
+        # deferring reconstruction to post_process_requests loses routing for an
+        # arbitrary subset of requests. Reconstruct here while blocks are intact.
+        finished_routing_indices = {}
+        if context.moe_enable_routing_replay and finished_idxs.numel() > 0:
             for fidx in finished_idxs.tolist():
                 req_id = int(context.request_ids[fidx].item())
                 blocks = context.request_to_kv_block_ids[fidx]
                 valid = blocks[blocks >= 0].tolist()
-                if valid:
-                    finished_routing_block_ids[req_id] = valid
+                if not valid:
+                    continue
+                total_tokens = int(
+                    active_sequence_lengths[fidx - context.paused_request_count].item()
+                )
+                routing = context.kv_block_allocator.reconstruct_routing_from_blocks(
+                    valid, total_tokens - 1
+                )
+                if routing is not None:
+                    finished_routing_indices[req_id] = routing
 
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
         # which would corrupt the reused buffer.
@@ -1691,7 +1704,7 @@ class TextGenerationController:
             # the separate new_sample_copy). Returning the CPU copy avoids a
             # D2H sync when the engine later calls sample.tolist().
             "sample": sampled_tokens_cpu,
-            "finished_routing_block_ids": finished_routing_block_ids,
+            "finished_routing_indices": finished_routing_indices,
             **(update_result or {}),
         }
 

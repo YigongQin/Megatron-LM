@@ -1153,7 +1153,7 @@ class DynamicInferenceEngine(AbstractEngine):
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
         pre_fwd_active_token_count: Optional[int] = None,
         pre_fwd_step_count: Optional[int] = None,
-        finished_routing_block_ids: Optional[Dict[int, list[int]]] = None,
+        finished_routing_indices: Optional[Dict[int, "np.ndarray"]] = None,
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest]]:
         """
         Handles post-processing for requests after a step.
@@ -1168,9 +1168,9 @@ class DynamicInferenceEngine(AbstractEngine):
             log_probs: (List): Log probs for each request
             top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to
                 list of (top_n_logprobs, top_n_indices) tuples.
-            finished_routing_block_ids: (Dict[int, List[int]]): Block IDs for
-                finished requests, saved before update_requests released them.
-                Used for per-block routing reconstruction.
+            finished_routing_indices: (Dict[int, np.ndarray]): Reconstructed MoE
+                routing arrays for finished requests, built before update_requests
+                released/reallocated their KV blocks.
 
         Returns:
             A list of active requests and completed requests as `DynamicInferenceRequest` objects
@@ -1320,19 +1320,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     ).long()
 
                 if request_id in finished_request_ids:
-                    # Reconstruct routing from per-block storage before popping.
+                    # Routing was reconstructed in _dynamic_step_context_bookkeeping,
+                    # before update_requests released/reallocated the request's KV
+                    # blocks (reallocation pops the per-block routing store).
                     if (
-                        finished_routing_block_ids
-                        and request_id in finished_routing_block_ids
-                        and len(self.requests[request_id].record.requests) == 1
+                        finished_routing_indices
+                        and request_id in finished_routing_indices
                     ):
-                        block_ids = finished_routing_block_ids[request_id]
-                        total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
-                        request.routing_indices = (
-                            self.context.kv_block_allocator.reconstruct_routing_from_blocks(
-                                block_ids, total_tokens - 1
-                            )
-                        )
+                        request.routing_indices = finished_routing_indices[request_id]
 
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
                     request.generated_length = len(request.generated_tokens)
@@ -1972,7 +1967,7 @@ class DynamicInferenceEngine(AbstractEngine):
             accepted_tokens = step_result["accepted_tokens"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
-            finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
+            finished_routing_indices = step_result.get("finished_routing_indices", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
             # Add paused events.
@@ -1992,7 +1987,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 top_n_logprobs,
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
                 pre_fwd_step_count=context_state.get("step_count"),
-                finished_routing_block_ids=finished_routing_block_ids,
+                finished_routing_indices=finished_routing_indices,
             )
 
         else:
