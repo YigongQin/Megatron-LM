@@ -823,6 +823,25 @@ class MambaMixer(MegatronModule):
             dim=-1,
         )
 
+        if is_dynamic_batching and self.config.batch_invariant_mode:
+            # True-on-policy reference path: run each prefill request through the
+            # exact kernels the training/logprob forward uses (external
+            # causal_conv1d_fn + non-fused mamba_chunk_scan_combined with
+            # use_mamba_mem_eff_path=False) instead of the in-tree varlen kernels,
+            # which are a different implementation lineage and diverge ~1e-2/token.
+            return self._ssm_prefill_reference(
+                z=z,
+                xBC=xBC,
+                dt=dt,
+                A=A,
+                cu_seqlens=cu_seqlens,
+                cu_seqlens_list=cu_seqlens_list,
+                batch_indices=batch_indices,
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                intermediate_ssm_out=intermediate_ssm_out,
+            )
+
         # Compute short convolution
         xBC_pre_conv = None
         if conv_state is not None and is_dynamic_batching:
@@ -1050,6 +1069,192 @@ class MambaMixer(MegatronModule):
             z = self.cp.post_conv_ssm(z)
             y = self.norm(y, z)
 
+        return y
+
+    def _ssm_prefill_reference(
+        self,
+        *,
+        z: torch.Tensor,
+        xBC: torch.Tensor,
+        dt: torch.Tensor,
+        A: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        cu_seqlens_list: Optional[List[int]],
+        batch_indices: Optional[torch.Tensor],
+        conv_state: Optional[torch.Tensor],
+        ssm_state: Optional[torch.Tensor],
+        intermediate_ssm_out: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Per-request prefill through the training-reference kernels.
+
+        Mirrors the static-batching branch of `_ssm_prefill` (what the
+        training/logprob forward runs with `use_mamba_mem_eff_path=False`) for
+        each request independently: full-sequence `causal_conv1d_fn` (or the
+        same fallback conv the static branch uses) followed by the non-fused
+        external `mamba_chunk_scan_combined`, so prefill outputs are computed
+        by the exact kernels of the training forward. Replaces the in-tree
+        varlen kernels (a different implementation lineage) under
+        `batch_invariant_mode`.
+
+        State semantics for the BIK buffered decode
+        (`_bik_decode_buffered_scan`): `ssm_state[slot]` must hold the state at
+        the LAST COMPLETE chunk boundary, not the sequence end — the decode
+        re-scans the partial-chunk tail from that boundary. When the prompt
+        tail is partial, a second truncated scan over the complete-chunk
+        prefix produces that boundary state (bitwise identical to the full
+        scan's internal boundary state, since chunk k's boundary state depends
+        only on chunks 0..k-1).
+
+        CG-incompat: host-side per-request loop; requires
+        `cuda_graph_impl=none`. Chunked prefill and Mamba prefix caching are
+        NOT supported: each request must arrive as a single whole-prompt
+        prefill so that `initial_states=None` matches training.
+        """
+        if intermediate_ssm_out is not None:
+            raise NotImplementedError(
+                "batch_invariant_mode reference prefill does not support Mamba "
+                "prefix caching (set enable_prefix_caching=false)."
+            )
+        assert mamba_chunk_scan_combined is not None, (
+            "mamba_ssm is required for the batch-invariant reference prefill "
+            "(same kernel as the training forward)."
+        )
+        assert (
+            self.cp.cp_size == 1 or self.rmsnorm
+        ), "Context parallel not supported for the reference prefill and rmsnorm==False"
+        batch, seqlen_total, _ = xBC.shape
+        assert batch == 1, "dynamic-batching prefill expects a flattened [1, T, d] layout"
+
+        cu = cu_seqlens_list if cu_seqlens_list is not None else cu_seqlens.tolist()
+        num_seqs = len(cu) - 1
+        nheads = self.cp.nheads_local_tpcp
+        ngroups = self.cp.ngroups_local_tpcp
+
+        D = (
+            rearrange(self.cp.get_D().float(), "(h p) -> h p", p=self.headdim)
+            if self.D_has_hdim
+            else self.cp.get_D()
+        )
+        dt_bias = self.cp.get_dt_bias().float()
+        conv_weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w")
+        conv_bias = self.cp.get_conv1d_bias()
+
+        # Flat scan-input buffers: y for output assembly, the rest to seed the
+        # BIK decode buffers with the exact tensors the scan consumed.
+        y_flat = torch.zeros(
+            seqlen_total, nheads, self.headdim, device=xBC.device, dtype=xBC.dtype
+        )
+        x_scan = torch.zeros_like(y_flat)
+        z_scan = torch.zeros_like(y_flat)
+        B_scan = torch.zeros(
+            seqlen_total, ngroups, self.d_state, device=xBC.device, dtype=xBC.dtype
+        )
+        C_scan = torch.zeros_like(B_scan)
+        dt_flat = dt.squeeze(0).contiguous()
+
+        for r in range(num_seqs):
+            start, end = int(cu[r]), int(cu[r + 1])
+            if end <= start:
+                continue  # padding request (decode-only rank / graph padding)
+            slot = int(batch_indices[r].item()) if batch_indices is not None else r
+            if slot < 0:
+                continue
+            seqlen = end - start
+
+            # Conv: exact static-branch math (raw-input window into conv_state,
+            # then full-sequence causal conv in the params dtype).
+            xBC_r = rearrange(xBC[:, start:end], "b l d -> b d l").contiguous()
+            if conv_state is not None:
+                conv_state[slot].copy_(
+                    F.pad(xBC_r, (self.d_conv - xBC_r.shape[-1], 0)).squeeze(0)
+                )
+            if causal_conv1d_fn is None:
+                xBC_c = self.act(self.cp.conv1d(xBC_r)[..., :seqlen])
+            else:
+                assert self.activation in ["silu", "swish"]
+                xBC_c = causal_conv1d_fn(
+                    x=xBC_r, weight=conv_weight, bias=conv_bias, activation=self.activation
+                )
+            xBC_c = rearrange(xBC_c, "b d l -> b l d").contiguous()
+
+            x_r, B_r, C_r = torch.split(
+                xBC_c,
+                [
+                    self.cp.d_inner_local_tpcp,
+                    ngroups * self.d_state,
+                    ngroups * self.d_state,
+                ],
+                dim=-1,
+            )
+            x_r = rearrange(x_r, "b l (h p) -> b l h p", p=self.headdim).contiguous()
+            B_r = rearrange(B_r, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+            C_r = rearrange(C_r, "b l (g n) -> b l g n", n=self.d_state).contiguous()
+            z_r = rearrange(
+                z[:, start:end], "b l (h p) -> b l h p", p=self.headdim
+            ).contiguous()
+            dt_r = dt[:, start:end].contiguous()
+
+            # Scan: exact static-branch call (initial_states=None == training).
+            y_r = mamba_chunk_scan_combined(
+                x_r,
+                dt_r,
+                A,
+                B_r,
+                C_r,
+                self.chunk_size,
+                D=D,
+                z=z_r if not self.rmsnorm else None,
+                dt_bias=dt_bias,
+                dt_softplus=True,
+                return_final_states=ssm_state is not None,
+                initial_states=None,
+            )
+            if ssm_state is not None:
+                y_r, last_state = y_r
+                tail = seqlen % self.chunk_size if seqlen >= self.chunk_size else seqlen
+                if seqlen >= self.chunk_size and tail > 0:
+                    # BIK decode needs the state at the last complete chunk
+                    # boundary; re-scan the complete-chunk prefix for it.
+                    boundary = seqlen - tail
+                    _, boundary_state = mamba_chunk_scan_combined(
+                        x_r[:, :boundary],
+                        dt_r[:, :boundary],
+                        A,
+                        B_r[:, :boundary],
+                        C_r[:, :boundary],
+                        self.chunk_size,
+                        D=D,
+                        z=z_r[:, :boundary] if not self.rmsnorm else None,
+                        dt_bias=dt_bias,
+                        dt_softplus=True,
+                        return_final_states=True,
+                        initial_states=None,
+                    )
+                    ssm_state[slot].copy_(boundary_state.squeeze(0))
+                else:
+                    # tail == 0: end state IS the boundary state. seqlen <
+                    # chunk_size: no boundary exists; decode uses a zero init
+                    # (_bik_state_is_zero) and never reads this value.
+                    ssm_state[slot].copy_(last_state.squeeze(0))
+
+            y_flat[start:end] = y_r.squeeze(0)
+            x_scan[start:end] = x_r.squeeze(0)
+            B_scan[start:end] = B_r.squeeze(0)
+            C_scan[start:end] = C_r.squeeze(0)
+            z_scan[start:end] = z_r.squeeze(0)
+
+        if ssm_state is not None:
+            self._bik_seed_decode_buffers(
+                x_scan, dt_flat, B_scan, C_scan, z_scan, cu_seqlens, batch_indices, ssm_state
+            )
+
+        # Shared tail, mirroring the static branch: back to (l, b, d) + gated norm.
+        y = rearrange(y_flat.unsqueeze(0), "b l h p -> l b (h p)").contiguous()
+        y = self.cp.post_conv_ssm(y)
+        if self.rmsnorm:
+            z_t = rearrange(z, "b l d -> l b d").contiguous()
+            z_t = self.cp.post_conv_ssm(z_t)
+            y = self.norm(y, z_t)
         return y
 
     def _get_decode_A_neg_exp(self) -> torch.Tensor:
