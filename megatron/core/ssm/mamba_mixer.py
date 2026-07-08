@@ -1493,6 +1493,71 @@ class MambaMixer(MegatronModule):
         y = torch.cat(outs, dim=0)  # (B_dec, 1, H, P)
         return rearrange(y, "b s h p -> b s (h p)")
 
+    def _bik_decode_conv_reference(
+        self,
+        xBC: torch.Tensor,
+        conv_state: torch.Tensor,
+        batch_indices: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Decode-step conv through the training conv path, bitwise to prefill.
+
+        Default decode uses the in-tree `causal_conv1d_update` Triton kernel,
+        a different implementation than the full-sequence conv the training
+        forward (and `_ssm_prefill_reference`) runs. Here the raw-input window
+        in `conv_state` is shifted and the new token appended, then the conv
+        output for the new token is computed by running the SAME full-sequence
+        conv over the d_conv-token window in the params dtype: the last output
+        of a causal conv over the window equals the full-sequence conv at that
+        position (the window buffer starts zero-padded, matching the causal
+        conv's implicit left padding for early tokens).
+
+        CG-incompat: per-request `.item()` host syncs; requires
+        cuda_graph_impl=none (as the BIK buffered scan already does).
+        """
+        batch_size, seq_len, _ = xBC.shape
+        assert seq_len == 1, (
+            "BIK decode conv assumes one new token per request per call "
+            "(no speculative decoding)."
+        )
+        dtype = xBC.dtype
+        if batch_indices is not None:
+            slots = batch_indices.to(torch.long)
+        else:
+            slots = torch.arange(batch_size, device=xBC.device, dtype=torch.long)
+
+        conv_weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w")
+        conv_bias = self.cp.get_conv1d_bias()
+
+        outs = []
+        for i in range(batch_size):
+            slot = int(slots[i].item())
+            if slot < 0:
+                # Padding / inactive batch slot.
+                outs.append(torch.zeros_like(xBC[i : i + 1, 0]))
+                continue
+            # Shift the raw-input window and append the new raw token
+            # (same state semantics as causal_conv1d_update / the prefill's
+            # F.pad window write; values are bf16-representable so the cache
+            # dtype roundtrip is exact).
+            window = conv_state[slot]
+            window.copy_(torch.roll(window, shifts=-1, dims=-1))
+            window[:, -1] = xBC[i, 0].to(window.dtype)
+
+            win_in = window.unsqueeze(0).to(dtype)  # [1, d, w] in params dtype
+            if causal_conv1d_fn is None:
+                out = self.act(self.cp.conv1d(win_in)[..., : window.shape[-1]])[..., -1]
+            else:
+                assert self.activation in ["silu", "swish"]
+                out = causal_conv1d_fn(
+                    x=win_in,
+                    weight=conv_weight,
+                    bias=conv_bias,
+                    activation=self.activation,
+                )[..., -1]
+            outs.append(out.to(dtype))
+
+        return torch.cat(outs, dim=0).unsqueeze(1)  # [b, 1, d]
+
     def train(self, mode: bool = True):
         """Mark the decode cache stale; weights may have updated."""
         if mode:
@@ -1542,7 +1607,12 @@ class MambaMixer(MegatronModule):
         )
 
         # Conv step
-        if causal_conv1d_update is None:
+        if self.config.batch_invariant_mode:
+            assert intermediate_conv_state is None, (
+                "BIK decode conv does not support speculative-decoding rollback buffers."
+            )
+            xBC = self._bik_decode_conv_reference(xBC, conv_state, batch_indices)
+        elif causal_conv1d_update is None:
             # TODO(ksanthanam): Consider deprecating this path
             assert seq_len == 1, "Native PyTorch fallback only supports 1 token at a time"
             xBC_squeeze = xBC.squeeze(1)
