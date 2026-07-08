@@ -1384,8 +1384,11 @@ class MambaMixer(MegatronModule):
         `chunk_size`, we snapshot the returned state as the new ssm_state
         and reset the buffer.
 
-        CG-incompat: per-request `.item()` host syncs prevent CUDA-graph
-        capture. Use `--cuda-graph-impl=none` for hybrid models under BIK.
+        Batched: one host metadata transfer per call, then one scan kernel per
+        (buffer-length, zero-init) group — rows are independent in the chunk
+        scan (training runs it batched), so grouping is bitwise-identical to
+        per-request calls. Still CG-incompatible (host-dependent control
+        flow); use `--cuda-graph-impl=none` for hybrid models under BIK.
         """
         B = rearrange(B, "b s (g n) -> b s g n", g=self.ngroups_local_tp)
         C = rearrange(C, "b s (g n) -> b s g n", g=self.ngroups_local_tp)
@@ -1433,39 +1436,55 @@ class MambaMixer(MegatronModule):
             slots = batch_indices.to(torch.long)
         else:
             slots = torch.arange(B_dec, device=dev, dtype=torch.long)
+        slots_safe = slots.clamp(min=0)
 
-        outs = []
-        for i in range(B_dec):
-            slot = slots[i].item()
-            if slot < 0:
-                # Padding / inactive batch slot.
-                outs.append(torch.zeros(1, 1, nh, p, device=dev, dtype=x.dtype))
-                continue
-            cnt = int(self._bik_chunk_count[slot].item())
+        # Single host transfer for the loop metadata (replaces per-request
+        # .item() syncs, which serialized every kernel launch).
+        slots_list = slots.tolist()
+        cnts_list = self._bik_chunk_count.index_select(0, slots_safe).tolist()
+        zero_list = self._bik_state_is_zero.index_select(0, slots_safe).tolist()
 
-            # Write the new token directly into the persistent buffer at
-            # position `cnt`, then slice out the first cnt+1 tokens. Slicing
-            # the first dim (slot:slot+1) of a contiguous (max_batch, buf_len,
-            # …) tensor yields a contiguous (1, cnt+1, …) tensor — what the
-            # kernel needs without a copy.
-            self._bik_chunk_x_buf[slot, cnt] = x[i, 0]
-            self._bik_chunk_dt_buf[slot, cnt] = dt[i, 0]
-            self._bik_chunk_B_buf[slot, cnt] = B[i, 0]
-            self._bik_chunk_C_buf[slot, cnt] = C[i, 0]
-            if z is not None:
-                self._bik_chunk_z_buf[slot, cnt] = z[i, 0]
+        rows = [i for i, s in enumerate(slots_list) if s >= 0]
+        y = torch.zeros(B_dec, 1, nh, p, device=dev, dtype=x.dtype)
+        if not rows:
+            return rearrange(y, "b s h p -> b s (h p)")
 
-            x_buf = self._bik_chunk_x_buf[slot : slot + 1, : cnt + 1]
-            dt_buf = self._bik_chunk_dt_buf[slot : slot + 1, : cnt + 1]
-            B_buf = self._bik_chunk_B_buf[slot : slot + 1, : cnt + 1]
-            C_buf = self._bik_chunk_C_buf[slot : slot + 1, : cnt + 1]
-            z_buf = self._bik_chunk_z_buf[slot : slot + 1, : cnt + 1] if z is not None else None
+        # Vectorized buffer append: token i lands at (slot_i, cnt_i).
+        idx_slot = torch.tensor([slots_list[i] for i in rows], device=dev, dtype=torch.long)
+        idx_cnt = torch.tensor([cnts_list[i] for i in rows], device=dev, dtype=torch.long)
+        rows_t = torch.tensor(rows, device=dev, dtype=torch.long)
+        self._bik_chunk_x_buf[idx_slot, idx_cnt] = x[rows_t, 0]
+        self._bik_chunk_dt_buf[idx_slot, idx_cnt] = dt[rows_t, 0]
+        self._bik_chunk_B_buf[idx_slot, idx_cnt] = B[rows_t, 0]
+        self._bik_chunk_C_buf[idx_slot, idx_cnt] = C[rows_t, 0]
+        if z is not None:
+            self._bik_chunk_z_buf[idx_slot, idx_cnt] = z[rows_t, 0]
 
-            init = (
-                None
-                if bool(self._bik_state_is_zero[slot])
-                else (ssm_state[slot : slot + 1].contiguous())
+        # Group rows by (buffer length, zero-init) and run ONE batched scan per
+        # group. Rows are independent in the chunk scan — training itself runs
+        # the same kernel batched — so this is bitwise-identical to the
+        # per-request calls (empirically confirmed by the per-request form
+        # matching training's batched form at ~1e-10 KL).
+        groups: dict = {}
+        for i in rows:
+            groups.setdefault((cnts_list[i], bool(zero_list[i])), []).append(i)
+
+        for (cnt, is_zero), g_rows in groups.items():
+            g_slots = torch.tensor(
+                [slots_list[i] for i in g_rows], device=dev, dtype=torch.long
             )
+            length = cnt + 1
+            x_buf = self._bik_chunk_x_buf.index_select(0, g_slots)[:, :length].contiguous()
+            dt_buf = self._bik_chunk_dt_buf.index_select(0, g_slots)[:, :length].contiguous()
+            B_buf = self._bik_chunk_B_buf.index_select(0, g_slots)[:, :length].contiguous()
+            C_buf = self._bik_chunk_C_buf.index_select(0, g_slots)[:, :length].contiguous()
+            z_buf = (
+                self._bik_chunk_z_buf.index_select(0, g_slots)[:, :length].contiguous()
+                if z is not None
+                else None
+            )
+            init = None if is_zero else ssm_state.index_select(0, g_slots).contiguous()
+
             y_run, new_state = mamba_chunk_scan_combined(
                 x_buf,
                 dt_buf,
@@ -1480,17 +1499,17 @@ class MambaMixer(MegatronModule):
                 initial_states=init,
                 return_final_states=True,
             )
-            outs.append(y_run[:, -1:])
+            g_rows_t = torch.tensor(g_rows, device=dev, dtype=torch.long)
+            y[g_rows_t] = y_run[:, -1:].to(y.dtype)
 
-            if cnt + 1 == self.chunk_size:
-                # Run ended on a chunk boundary — snapshot state, reset buffer.
-                ssm_state[slot] = new_state.squeeze(0).to(ssm_state.dtype)
-                self._bik_chunk_count[slot] = 0
-                self._bik_state_is_zero[slot] = False
+            if length == self.chunk_size:
+                # Runs ended on a chunk boundary — snapshot states, reset buffers.
+                ssm_state.index_copy_(0, g_slots, new_state.to(ssm_state.dtype))
+                self._bik_chunk_count.index_fill_(0, g_slots, 0)
+                self._bik_state_is_zero.index_fill_(0, g_slots, False)
             else:
-                self._bik_chunk_count[slot] = cnt + 1
+                self._bik_chunk_count.index_fill_(0, g_slots, length)
 
-        y = torch.cat(outs, dim=0)  # (B_dec, 1, H, P)
         return rearrange(y, "b s h p -> b s (h p)")
 
     def _bik_decode_conv_reference(
@@ -1511,8 +1530,10 @@ class MambaMixer(MegatronModule):
         position (the window buffer starts zero-padded, matching the causal
         conv's implicit left padding for early tokens).
 
-        CG-incompat: per-request `.item()` host syncs; requires
-        cuda_graph_impl=none (as the BIK buffered scan already does).
+        Fully batched: one gather + one conv kernel call for the whole decode
+        batch (rows are independent in the depthwise causal conv — training
+        itself runs it batched — so this is bitwise-identical to per-request
+        calls). Requires cuda_graph_impl=none (as the BIK buffered scan does).
         """
         batch_size, seq_len, _ = xBC.shape
         assert seq_len == 1, (
@@ -1524,39 +1545,34 @@ class MambaMixer(MegatronModule):
             slots = batch_indices.to(torch.long)
         else:
             slots = torch.arange(batch_size, device=xBC.device, dtype=torch.long)
+        slots_safe = slots.clamp(min=0)
+        active = (slots >= 0).view(-1, 1)
 
-        conv_weight = rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w")
-        conv_bias = self.cp.get_conv1d_bias()
+        # Shift the raw-input windows and append the new raw tokens for the
+        # whole batch (same state semantics as causal_conv1d_update / the
+        # prefill's F.pad window write; values are bf16-representable so the
+        # cache dtype roundtrip is exact). tensor_masked_update skips -1 slots.
+        windows = conv_state.index_select(0, slots_safe)  # [B, d, w]
+        windows = torch.cat(
+            [windows[:, :, 1:], xBC[:, 0].to(conv_state.dtype).unsqueeze(-1)], dim=-1
+        )
+        tensor_masked_update(conv_state, slots, windows)
 
-        outs = []
-        for i in range(batch_size):
-            slot = int(slots[i].item())
-            if slot < 0:
-                # Padding / inactive batch slot.
-                outs.append(torch.zeros_like(xBC[i : i + 1, 0]))
-                continue
-            # Shift the raw-input window and append the new raw token
-            # (same state semantics as causal_conv1d_update / the prefill's
-            # F.pad window write; values are bf16-representable so the cache
-            # dtype roundtrip is exact).
-            window = conv_state[slot]
-            window.copy_(torch.roll(window, shifts=-1, dims=-1))
-            window[:, -1] = xBC[i, 0].to(window.dtype)
+        win_in = windows.to(dtype)  # [B, d, w] in params dtype
+        if causal_conv1d_fn is None:
+            out = self.act(self.cp.conv1d(win_in)[..., : win_in.shape[-1]])[..., -1]
+        else:
+            assert self.activation in ["silu", "swish"]
+            out = causal_conv1d_fn(
+                x=win_in,
+                weight=rearrange(self.cp.get_conv1d_weight(), "d 1 w -> d w"),
+                bias=self.cp.get_conv1d_bias(),
+                activation=self.activation,
+            )[..., -1]
+        # Zero padding/inactive rows (their windows carried slot-0 content).
+        out = torch.where(active, out.to(dtype), torch.zeros_like(out, dtype=dtype))
 
-            win_in = window.unsqueeze(0).to(dtype)  # [1, d, w] in params dtype
-            if causal_conv1d_fn is None:
-                out = self.act(self.cp.conv1d(win_in)[..., : window.shape[-1]])[..., -1]
-            else:
-                assert self.activation in ["silu", "swish"]
-                out = causal_conv1d_fn(
-                    x=win_in,
-                    weight=conv_weight,
-                    bias=conv_bias,
-                    activation=self.activation,
-                )[..., -1]
-            outs.append(out.to(dtype))
-
-        return torch.cat(outs, dim=0).unsqueeze(1)  # [b, 1, d]
+        return out.unsqueeze(1)  # [b, 1, d]
 
     def train(self, mode: bool = True):
         """Mark the decode cache stale; weights may have updated."""
