@@ -39,6 +39,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
+    get_moe_routed_expert_padding_align_size,
     skip_routed_expert_padding,
 )
 from megatron.core.transformer.moe.paged_stash import (
@@ -319,9 +320,7 @@ class TEGroupedMLP(MegatronModule):
         self._use_grouped_tensor = self.config.moe_use_grouped_tensor
         if self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
             assert HAVE_TE, "Quantized or TE grouped-tensor GroupedMLP execution requires TE."
-            align_size = (
-                get_align_size_for_quantization(self.config) if self._use_grouped_tensor else None
-            )
+            align_size = get_moe_routed_expert_padding_align_size(self.config)
             self.quantization_padding = Fp8Padding(self.num_local_experts, align_size=align_size)
             self.quantization_unpadding = Fp8Unpadding(
                 self.num_local_experts, align_size=align_size

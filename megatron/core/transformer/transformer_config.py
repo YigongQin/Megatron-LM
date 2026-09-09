@@ -3544,6 +3544,10 @@ class TransformerConfig(ModelParallelConfig):
                     "this backend combination. "
                     "Install via `uv pip install -e .[batch_invariant]`."
                 )
+                te_mxfp8_supported_activation = (
+                    (not self.gated_linear_unit and self.activation_func == squared_relu)
+                    or (self.gated_linear_unit and self.activation_func == F.silu)
+                )
                 te_mxfp8_inference = (
                     self.transformer_impl == "inference_optimized"
                     and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TE
@@ -3552,13 +3556,10 @@ class TransformerConfig(ModelParallelConfig):
                     and self.fp8_recipe == Fp8Recipe.mxfp8
                     and self.fp8_param
                     and not self.fp4
-                    and (
-                        (not self.gated_linear_unit and self.activation_func == squared_relu)
-                        or (self.gated_linear_unit and self.activation_func == F.silu)
-                    )
+                    and te_mxfp8_supported_activation
                 )
                 assert te_mxfp8_inference or not (self.fp8 or self.fp4), (
-                    "Batch-invariant MoE supports bf16, or native TE MXFP8 squared-ReLU/"
+                    "Batch-invariant MoE supports bf16, or native TE MXFP8 squared-ReLU or "
                     "SwiGLU experts with the inference-optimized TE grouped-GEMM and "
                     "te_native batch-invariant backends."
                 )

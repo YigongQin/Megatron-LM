@@ -1660,6 +1660,7 @@ _TE_NATIVE_WORKSPACE_BYTES = 1024
 
 # Originals saved by _enable_te_native_workspace_starvation for restoration.
 _TE_WORKSPACE_SIZE_FN_ORIG = None
+_TE_GROUPED_WORKSPACE_FN_ORIG = None
 _TE_NATIVE_ENV_ORIG: dict = {}
 
 
@@ -1669,6 +1670,38 @@ def get_unrestricted_te_workspace_size_bytes() -> int:
 
     workspace_size_fn = _TE_WORKSPACE_SIZE_FN_ORIG or te_gemm.get_cublas_workspace_size_bytes
     return workspace_size_fn()
+
+
+def _make_unstarved_grouped_workspace_fn(workspace_size_fn):
+    """Build a replacement for TE's ``_get_grouped_cublas_workspace`` that skips starvation.
+
+    Scope: ``_get_grouped_cublas_workspace`` is allocated from exactly one place, TE's
+    ``general_grouped_gemm_for_grouped_tensor``, i.e. the fused grouped-tensor path behind
+    NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM=1 -- the MXFP8 MoE experts. Dense GEMMs and the
+    unfused grouped path allocate through ``get_cublas_workspace`` instead and stay starved, so
+    this exemption cannot leak into them.
+
+    Why it is safe to un-starve: that kernel's workspace size is the dtype-independent constant
+    kGroupedGemmCublasWorkspaceSize (32 MiB) in cublaslt_grouped_gemm.cu, and it hands that
+    constant to both cublasLtMatmulAlgoGetHeuristic and cublasLtMatmul no matter how large the
+    tensor it was given actually is. Starving this workspace therefore never disqualified split-K
+    here -- cuBLASLt always believed it had 32 MiB. All the starvation did was under-allocate the
+    buffer, which TE rejects with a hard NVTE_CHECK in validate_and_get_workspace_ptr.
+
+    Not addressed here: this path selects its algorithm from CUBLASLT_MATMUL_PREF_GROUPED_*
+    average-dimension hints, and the row hint is the average tokens per expert, which moves with
+    the routing distribution. Batch invariance of the grouped GEMM rests on those hints being
+    stable, not on workspace size.
+    """
+    import functools
+
+    @functools.lru_cache(maxsize=None)
+    def _get_grouped_cublas_workspace(device: int, layout: str) -> torch.Tensor:
+        # Per-layout buffers mirror TE: sharing one across layouts deadlocks on CUDA-graph replay.
+        assert layout in ("TN", "NN", "NT"), f"unexpected grouped GEMM layout {layout}"
+        return torch.empty(workspace_size_fn(), dtype=torch.uint8, device=device)
+
+    return _get_grouped_cublas_workspace
 
 
 def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WORKSPACE_BYTES):
@@ -1717,6 +1750,7 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
             "remain batch-variant. Enable batch-invariant mode before the "
             "first GEMM."
         )
+    global _TE_GROUPED_WORKSPACE_FN_ORIG
     try:
         import transformer_engine.pytorch.cpp_extensions.gemm as _te_gemm_mod
 
@@ -1727,6 +1761,15 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
             _te_gemm_mod.get_cublas_workspace_size_bytes = lambda: workspace_bytes
             if hasattr(getattr(_te_gemm_mod, "get_cublas_workspace", None), "cache_clear"):
                 _te_gemm_mod.get_cublas_workspace.cache_clear()
+        if _TE_GROUPED_WORKSPACE_FN_ORIG is None and hasattr(
+            _te_gemm_mod, "_get_grouped_cublas_workspace"
+        ):
+            _TE_GROUPED_WORKSPACE_FN_ORIG = _te_gemm_mod._get_grouped_cublas_workspace
+            _te_gemm_mod._get_grouped_cublas_workspace = _make_unstarved_grouped_workspace_fn(
+                _TE_WORKSPACE_SIZE_FN_ORIG or _te_gemm_mod.get_cublas_workspace_size_bytes
+            )
+            if hasattr(_TE_GROUPED_WORKSPACE_FN_ORIG, "cache_clear"):
+                _TE_GROUPED_WORKSPACE_FN_ORIG.cache_clear()
     except ImportError:
         pass
 
@@ -1736,16 +1779,24 @@ def _disable_te_native_workspace_starvation():
     import os
 
     global _TE_WORKSPACE_SIZE_FN_ORIG
-    if _TE_WORKSPACE_SIZE_FN_ORIG is not None:
+    global _TE_GROUPED_WORKSPACE_FN_ORIG
+    if _TE_WORKSPACE_SIZE_FN_ORIG is not None or _TE_GROUPED_WORKSPACE_FN_ORIG is not None:
         try:
             import transformer_engine.pytorch.cpp_extensions.gemm as _te_gemm_mod
 
-            _te_gemm_mod.get_cublas_workspace_size_bytes = _TE_WORKSPACE_SIZE_FN_ORIG
-            if hasattr(getattr(_te_gemm_mod, "get_cublas_workspace", None), "cache_clear"):
-                _te_gemm_mod.get_cublas_workspace.cache_clear()
+            if _TE_WORKSPACE_SIZE_FN_ORIG is not None:
+                _te_gemm_mod.get_cublas_workspace_size_bytes = _TE_WORKSPACE_SIZE_FN_ORIG
+                if hasattr(getattr(_te_gemm_mod, "get_cublas_workspace", None), "cache_clear"):
+                    _te_gemm_mod.get_cublas_workspace.cache_clear()
+            if _TE_GROUPED_WORKSPACE_FN_ORIG is not None:
+                replacement = _te_gemm_mod._get_grouped_cublas_workspace
+                _te_gemm_mod._get_grouped_cublas_workspace = _TE_GROUPED_WORKSPACE_FN_ORIG
+                if hasattr(replacement, "cache_clear"):
+                    replacement.cache_clear()
         except ImportError:
             pass
         _TE_WORKSPACE_SIZE_FN_ORIG = None
+        _TE_GROUPED_WORKSPACE_FN_ORIG = None
     for var, prev in _TE_NATIVE_ENV_ORIG.items():
         if prev is None:
             os.environ.pop(var, None)

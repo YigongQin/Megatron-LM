@@ -178,7 +178,26 @@ def test_config_accepts_te_mxfp8_batch_invariant_with_swiglu():
         attention_dropout=0.0,
     )
 
+    assert config.batch_invariant_mode
     assert config.gated_linear_unit
+
+
+def test_config_rejects_te_mxfp8_batch_invariant_with_unsupported_gated_activation():
+    """GeGLU and other gated activations remain unsupported on the TE MXFP8 BI path."""
+    with pytest.raises(AssertionError, match="squared-ReLU or SwiGLU"):
+        _make_base_config(
+            inference_grouped_gemm_backend="te",
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+            gated_linear_unit=True,
+            activation_func=torch.nn.functional.gelu,
+            batch_invariant_mode=True,
+            batch_invariant_backend="te_native",
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+        )
 
 
 @pytest.mark.internal
