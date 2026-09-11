@@ -39,6 +39,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
+    get_moe_routed_expert_padding_align_size,
     skip_routed_expert_padding,
 )
 from megatron.core.transformer.moe.paged_stash import (
@@ -84,7 +85,15 @@ except ImportError:
     HAVE_FLASHINFER = False
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
-from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
+from megatron.core.inference.moe import (
+    InferenceGroupedGemmBackend,
+    TEBF16GroupedWeight,
+    is_te_mxfp8_weight,
+    mcore_fused_moe,
+    prepare_te_mxfp8_batch_invariant_weight,
+    refresh_te_mxfp8_batch_invariant_weight,
+    vllm_fused_moe,
+)
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     FlashInferRoutedMXFP8Weight,
     flashinfer_routed_mxfp8_moe,
@@ -311,9 +320,7 @@ class TEGroupedMLP(MegatronModule):
         self._use_grouped_tensor = self.config.moe_use_grouped_tensor
         if self.config.fp8 or self.config.fp4 or self._use_grouped_tensor:
             assert HAVE_TE, "Quantized or TE grouped-tensor GroupedMLP execution requires TE."
-            align_size = (
-                get_align_size_for_quantization(self.config) if self._use_grouped_tensor else None
-            )
+            align_size = get_moe_routed_expert_padding_align_size(self.config)
             self.quantization_padding = Fp8Padding(self.num_local_experts, align_size=align_size)
             self.quantization_unpadding = Fp8Unpadding(
                 self.num_local_experts, align_size=align_size
@@ -1157,10 +1164,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
     """Inference-optimized GroupedMLP with GPU-resident offsets.
 
     Inherits from TEGroupedMLP to reuse weight initialization and checkpoint compatibility.
-    Supports three forward paths:
+    Supports backend-selected inference grouped-GEMM paths:
     - Training: delegates to parent TEGroupedMLP
     - Inference + FlashInfer: CUTLASS fused MoE for BF16 or routed block-scale MoE for MXFP8
-    - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets
+    - Inference + torch: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets
+    - Inference + TE: native MXFP8 device-metadata grouped quantization and grouped GEMM
+    - Inference + vLLM: Triton fused MoE
     """
 
     def __init__(
@@ -1323,6 +1332,58 @@ class InferenceGroupedMLP(TEGroupedMLP):
             prepare_routed_mxfp8_weights(canonical_weight, out=routed_weight)
         return True
 
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def _build_te_mxfp8_weights(self):
+        """Compatibility entry point for callers that require native TE MXFP8 storage."""
+        InferenceGroupedMLP._build_te_inference_weights(self, expected_mxfp8=True)
+
+    def _get_te_grouped_weight(self, linear_name: str):
+        """Return a TE grouped linear's discrete or single-parameter weight."""
+        linear = getattr(self, linear_name)
+        if getattr(linear, 'single_grouped_weight', False):
+            return linear.weight
+        return [getattr(linear, f'weight{i}') for i in range(self.num_local_experts)]
+
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def _build_te_inference_weights(self, expected_mxfp8: Optional[bool] = None):
+        """Keep each layer's native TE BF16 or MXFP8 expert representation."""
+        layer_is_mxfp8 = None
+        for linear_name, buf_name in [('linear_fc1', '_fc1_weight'), ('linear_fc2', '_fc2_weight')]:
+            weight = InferenceGroupedMLP._get_te_grouped_weight(self, linear_name)
+            weight_is_mxfp8 = is_te_mxfp8_weight(weight)
+            if expected_mxfp8 is not None and weight_is_mxfp8 != expected_mxfp8:
+                expected = "MXFP8" if expected_mxfp8 else "BF16"
+                raise RuntimeError(f"Expected {expected} expert weights for {linear_name}.")
+            if layer_is_mxfp8 is not None and weight_is_mxfp8 != layer_is_mxfp8:
+                raise RuntimeError("TE inference requires FC1 and FC2 to use the same precision.")
+            layer_is_mxfp8 = weight_is_mxfp8
+
+            # Keep non-owning references so state_dict and parameter traversal stay unchanged.
+            object.__setattr__(
+                self, buf_name, weight if weight_is_mxfp8 else TEBF16GroupedWeight(weight)
+            )
+            if weight_is_mxfp8 and getattr(
+                getattr(self, "config", None), "batch_invariant_mode", False
+            ):
+                prepare_te_mxfp8_batch_invariant_weight(weight)
+
+    @torch.inference_mode(False)
+    @torch.no_grad()
+    def refresh_te_mxfp8_batch_invariant_weights(self) -> bool:
+        """Refresh graph-stable TE grouped-weight scales in place after refit."""
+        if (
+            not self._concatenated_weights_built
+            or self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.TE
+            or isinstance(getattr(self, '_fc1_weight', None), TEBF16GroupedWeight)
+        ):
+            return False
+        refreshed = False
+        for weight in (self._fc1_weight, self._fc2_weight):
+            refreshed = refresh_te_mxfp8_batch_invariant_weight(weight) or refreshed
+        return refreshed
+
     @torch.inference_mode(False)  # needed for non-colocated inference.
     def _build_concatenated_weights(self):
         """Create big contiguous weight tensors that share storage with TE's per-expert parameters.
@@ -1412,7 +1473,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         return output, None
 
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
-        """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
+        """MCore permutation with the selected Torch or TE grouped-GEMM path."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
         output = mcore_fused_moe(
             hidden_states,
@@ -1456,12 +1517,14 @@ class InferenceGroupedMLP(TEGroupedMLP):
         permuted_probs: torch.Tensor,
         routing_map: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Forward pass with three modes:
+        """Forward pass with backend-selected inference grouped GEMMs:
 
         - Training: delegates to parent TEGroupedMLP.
         - Inference + FlashInfer: fused BF16 or routed MXFP8 MoE. tokens_per_expert
           is not used in this path; the FlashInfer kernels operate directly on routing_map.
-        - Inference + eager: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets.
+        - Inference + torch: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets.
+        - Inference + TE: native BF16/MXFP8 grouped GEMM with CUDA split metadata.
+        - Inference + vLLM: Triton fused MoE.
 
         Args:
             permuted_local_hidden_states: [num_tokens, hidden_size] input hidden states.
@@ -1480,13 +1543,16 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
         # Lazily build concatenated weights on first forward (after checkpoint load)
         if not self._concatenated_weights_built:
-            w = self.linear_fc1.weight0
-            if isinstance(w, MXFP8Tensor) or (
-                hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor)
-            ):
-                self._build_concatenated_mxfp8_weights()
+            if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TE:
+                self._build_te_inference_weights()
             else:
-                self._build_concatenated_weights()
+                w = self.linear_fc1.weight0
+                if isinstance(w, MXFP8Tensor) or (
+                    hasattr(w, 'data') and isinstance(w.data, MXFP8Tensor)
+                ):
+                    self._build_concatenated_mxfp8_weights()
+                else:
+                    self._build_concatenated_weights()
             self._concatenated_weights_built = True
 
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER:
@@ -1495,7 +1561,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return self._flashinfer_forward(
                 permuted_local_hidden_states, routing_map, permuted_probs
             )
-        elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
+        elif self.inference_grouped_gemm_backend in (
+            InferenceGroupedGemmBackend.TORCH,
+            InferenceGroupedGemmBackend.TE,
+        ):
+            # Both share MCore's permute/activation pipeline; mcore_fused_moe selects the
+            # grouped GEMM from the weight representation built above.
             return self._mcore_fused_moe_forward(
                 permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
@@ -1503,6 +1574,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
             return self._vllm_forward(
                 permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
+        raise ValueError(
+            f"Unsupported inference grouped-GEMM backend: {self.inference_grouped_gemm_backend}"
+        )
 
 
 class SequentialMLP(MegatronModule):

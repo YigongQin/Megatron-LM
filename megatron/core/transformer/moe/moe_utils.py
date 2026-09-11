@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 
 from megatron.core import parallel_state
+from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
@@ -1464,6 +1465,26 @@ def router_gating_linear(
         torch.Tensor: The output tensor.
     """
     return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
+
+
+# Native TE MXFP8 inference grouped GEMM (#6933) pads each expert segment to 256 rows.
+_TE_MXFP8_MOE_EXPERT_PADDING_ALIGN = 256
+
+
+def get_moe_routed_expert_padding_align_size(
+    config: TransformerConfig,
+) -> Optional[int]:
+    """Per-expert token padding alignment for ``TEGroupedMLP`` quantization padding.
+
+    Returns ``None`` to let Transformer Engine pick its default (typically 32 for MXFP8).
+    Training with ``fp8_recipe=mxfp8`` uses 256 so routed-expert segments match the
+    inference_optimized ``mcore_fused_moe`` TE backend.
+    """
+    if config.use_transformer_engine_op_fuser or config.moe_use_grouped_tensor:
+        return get_align_size_for_quantization(config)
+    if config.fp8 and config.fp8_recipe == Fp8Recipe.mxfp8:
+        return _TE_MXFP8_MOE_EXPERT_PADDING_ALIGN
+    return None
 
 
 def get_align_size_for_quantization(config: TransformerConfig) -> int:
