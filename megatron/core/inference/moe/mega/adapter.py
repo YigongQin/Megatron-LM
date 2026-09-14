@@ -76,8 +76,10 @@ class MegatronMegaMoEAdapter:
             )
         megakernel = build_megakernel_config(self._config)
         weights = megatron_grouped_weights_to_moe_pack(fc1_weight, fc2_weight)
-        # quantize_input must stay True: the BF16 megakernel has no
-        # pre-quantized activation path and rejects quantize_input=False.
+        # quantize_input must stay True: the megakernels have no pre-quantized
+        # activation path and reject quantize_input=False. The quantized
+        # precisions derive activation scales in-kernel, so no calibration data
+        # is needed here.
         mega_config = MegaConfig(megakernel=megakernel, preprocess_weights=True)
         self._layer = MoEEpMegaLayer(
             self._bootstrap(),
