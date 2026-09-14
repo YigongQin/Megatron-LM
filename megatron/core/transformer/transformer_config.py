@@ -1318,10 +1318,18 @@ class TransformerConfig(ModelParallelConfig):
       permutation via indirect addressing.
     """
 
-    inference_mega_precision: Literal['bf16'] = "bf16"
+    inference_mega_precision: Literal['bf16', 'mxfp8', 'nvfp4', 'fp8_fp4'] = "bf16"
     """Precision recipe for inference_grouped_gemm_backend='flashinfer_mega'. Selects
-    which FlashInfer megakernel variant to build; only the sm100 BF16 CuTeDSL kernel
-    is wired up today."""
+    which FlashInfer sm100 megakernel variant to build:
+
+    - 'bf16': BF16 CuTeDSL kernel, no quantization.
+    - 'mxfp8': MXFP8 (e4m3) CuTeDSL kernel.
+    - 'nvfp4': NVFP4 CuTeDSL kernel.
+    - 'fp8_fp4': block-scaled fp8 activations times mxfp4 weights, via DeepGEMM.
+      Requires the separate DeepGEMM package, which flashinfer does not depend on.
+
+    The quantized recipes take bf16 weights and quantize them inside FlashInfer at
+    warmup, so they are independent of Megatron's own --fp8 weight quantization."""
 
     inference_mega_max_tokens_per_rank: int = 128
     """Workspace capacity of the FlashInfer mega MoE kernel, in tokens per EP rank.
@@ -1841,10 +1849,14 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError(
                         "inference_mega_max_tokens_per_rank must be positive for flashinfer_mega."
                     )
+                # Megatron-side MXFP8 stores expert weights as MXFP8Tensor, which the
+                # mega weight packer cannot read. The mega kernels do their own
+                # quantization from bf16 weights, selected by inference_mega_precision.
                 if mxfp8_enabled:
                     raise ValueError(
-                        "flashinfer_mega BF16 path does not support MXFP8 yet; "
-                        "disable --fp8 or use inference_mega_precision=bf16 only."
+                        "flashinfer_mega cannot consume Megatron-side MXFP8 weights; "
+                        "disable --fp8 and select the kernel's own quantization with "
+                        "inference_mega_precision (bf16, mxfp8, nvfp4, fp8_fp4)."
                     )
                 # The megakernel stacks gate+up into w13 and applies SwiGLU, so a
                 # non-gated activation has no representable weight layout.
@@ -1862,10 +1874,35 @@ class TransformerConfig(ModelParallelConfig):
                         "activation_func_tanh_clamp_scale (SiTU-GLU); the megakernel "
                         "only offers a hard FC1 clamp."
                     )
-                # preprocess_mega_weights interleaves gate/up in blocks of 32.
-                if self.moe_ffn_hidden_size % 32:
+                # Shape alignment is per precision: each kernel's weight
+                # interleaving and activation-staging quantizer impose their own
+                # bounds. Enforced here so a bad geometry fails at config time
+                # rather than inside the first forward on every EP rank.
+                # (hidden divisor, post-SwiGLU moe_ffn divisor)
+                mega_alignment = {
+                    'bf16': (32, 64),
+                    'mxfp8': (64, 32),
+                    'nvfp4': (64, 16),
+                    'fp8_fp4': (128, 32),
+                }
+                if self.inference_mega_precision not in mega_alignment:
                     raise ValueError(
-                        "flashinfer_mega requires moe_ffn_hidden_size divisible by 32; "
+                        "inference_mega_precision must be one of "
+                        f"{sorted(mega_alignment)}; got "
+                        f"'{self.inference_mega_precision}'."
+                    )
+                hidden_div, ffn_div = mega_alignment[self.inference_mega_precision]
+                if self.hidden_size % hidden_div:
+                    raise ValueError(
+                        f"flashinfer_mega with inference_mega_precision="
+                        f"'{self.inference_mega_precision}' requires hidden_size "
+                        f"divisible by {hidden_div}; got {self.hidden_size}."
+                    )
+                if self.moe_ffn_hidden_size % ffn_div:
+                    raise ValueError(
+                        f"flashinfer_mega with inference_mega_precision="
+                        f"'{self.inference_mega_precision}' requires "
+                        f"moe_ffn_hidden_size divisible by {ffn_div}; "
                         f"got {self.moe_ffn_hidden_size}."
                     )
                 if self.num_moe_experts % self.expert_model_parallel_size:

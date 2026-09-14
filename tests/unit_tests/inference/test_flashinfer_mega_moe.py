@@ -72,8 +72,36 @@ class TestFlashinferMegaConfig:
             _config(activation_func_tanh_clamp_scale=7.0)
 
     def test_rejects_unaligned_moe_ffn_hidden_size(self):
-        with pytest.raises(ValueError, match="divisible by 32"):
+        with pytest.raises(ValueError, match="moe_ffn_hidden_size divisible by 64"):
             _config(moe_ffn_hidden_size=120)
+
+    @pytest.mark.parametrize(
+        "precision,hidden,moe_ffn",
+        [
+            ("bf16", 128, 128),
+            ("mxfp8", 128, 160),  # mxfp8 needs moe_ffn % 32 only
+            ("nvfp4", 128, 144),  # nvfp4 needs moe_ffn % 16 only
+            ("fp8_fp4", 128, 128),
+        ],
+    )
+    def test_accepts_per_precision_alignment(self, precision, hidden, moe_ffn):
+        cfg = _config(
+            inference_mega_precision=precision, hidden_size=hidden, moe_ffn_hidden_size=moe_ffn
+        )
+        assert cfg.inference_mega_precision == precision
+
+    @pytest.mark.parametrize(
+        "precision,hidden,divisor",
+        [("bf16", 112, 32), ("mxfp8", 96, 64), ("nvfp4", 96, 64), ("fp8_fp4", 192, 128)],
+    )
+    def test_rejects_unaligned_hidden_size(self, precision, hidden, divisor):
+        # Each kernel's activation staging quantizer sets its own hidden bound.
+        with pytest.raises(ValueError, match=f"hidden_size divisible by {divisor}"):
+            _config(inference_mega_precision=precision, hidden_size=hidden)
+
+    def test_rejects_unknown_precision(self):
+        with pytest.raises(ValueError, match="inference_mega_precision must be one of"):
+            _config(inference_mega_precision="fp6")
 
     def test_rejects_experts_not_divisible_by_ep(self):
         with pytest.raises(ValueError, match="divisible by"):
