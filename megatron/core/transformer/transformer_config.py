@@ -1342,19 +1342,34 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
-    inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm'] = "vllm"
+    inference_grouped_gemm_backend: Literal[
+        'flashinfer', 'flashinfer_mega', 'torch', 'vllm'
+    ] = "vllm"
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
     - 'flashinfer': Uses FlashInfer cutlass_fused_moe for BF16 and TRT-LLM routed
       block-scale MoE for MXFP8. The MXFP8 path retains canonical expert weights
       for refit and also stores a padded TRT-LLM Major-K copy, increasing
       expert-weight memory relative to the torch backend.
+    - 'flashinfer_mega': Uses FlashInfer moe_ep mega kernels, which fuse EP transport
+      and the expert MLP into one symmetric-memory kernel. Tokens stay local per rank,
+      so Megatron's NVLS/NCCL gather around the experts is bypassed. SwiGLU only.
     - 'torch': Uses torch.nn.functional.grouped_mm (mcore_fused_moe with Triton kernels).
       Supports both BF16 and MXFP8.
     - 'vllm': Uses vLLM's Triton fused MoE kernel for BF16. Avoids physical token
       permutation via indirect addressing. MXFP8 expert layers use MCore's scaled
       grouped-GEMM path, allowing per-layer mixed BF16/MXFP8 policies.
     """
+
+    inference_mega_precision: Literal['bf16'] = "bf16"
+    """Precision recipe for inference_grouped_gemm_backend='flashinfer_mega'. Selects
+    which FlashInfer megakernel variant to build; only the sm100 BF16 CuTeDSL kernel
+    is wired up today."""
+
+    inference_mega_max_tokens_per_rank: int = 128
+    """Workspace capacity of the FlashInfer mega MoE kernel, in tokens per EP rank.
+    Sizes the symmetric-memory buffers, so a forward with more local tokens than this
+    is rejected rather than falling back."""
 
     inference_moe_disable_fused_quant_kernels: bool = False
     """When False (default), use fused kernels that combine permute/activation with
@@ -1879,10 +1894,12 @@ class TransformerConfig(ModelParallelConfig):
             if self.gated_linear_unit and self.inference_grouped_gemm_backend not in (
                 InferenceGroupedGemmBackend.TORCH,
                 InferenceGroupedGemmBackend.VLLM,
+                InferenceGroupedGemmBackend.FLASHINFER_MEGA,
             ):
                 raise ValueError(
                     "--transformer-impl='inference_optimized' supports gated linear units "
-                    "(SwiGLU/GeGLU) only with --inference-grouped-gemm-backend torch or vllm, "
+                    "(SwiGLU/GeGLU) only with --inference-grouped-gemm-backend torch, vllm, "
+                    "or flashinfer_mega, "
                     f"got '{self.inference_grouped_gemm_backend}'."
                 )
 
@@ -1892,6 +1909,53 @@ class TransformerConfig(ModelParallelConfig):
                         "fp8_param must be enabled when using "
                         "--transformer-impl='inference_optimized' with --fp8-recipe='mxfp8'. "
                         "Please set --fp8-param-gather."
+                    )
+
+            if (
+                self.inference_grouped_gemm_backend
+                == InferenceGroupedGemmBackend.FLASHINFER_MEGA
+            ):
+                if self.inference_mega_max_tokens_per_rank <= 0:
+                    raise ValueError(
+                        "inference_mega_max_tokens_per_rank must be positive for flashinfer_mega."
+                    )
+                if mxfp8_enabled:
+                    raise ValueError(
+                        "flashinfer_mega BF16 path does not support MXFP8 yet; "
+                        "disable --fp8 or use inference_mega_precision=bf16 only."
+                    )
+                # The megakernel stacks gate+up into w13 and applies SwiGLU, so a
+                # non-gated activation has no representable weight layout.
+                if not self.gated_linear_unit or self.activation_func != F.silu:
+                    raise ValueError(
+                        "flashinfer_mega only implements SwiGLU; set "
+                        "gated_linear_unit=True with activation_func=F.silu."
+                    )
+                # FlashInfer hard-clamps the FC1 output while
+                # activation_func_tanh_clamp_scale is a soft tanh clamp replacing
+                # the swish gate (SiTU-GLU). The two are not interchangeable.
+                if self.activation_func_tanh_clamp_scale is not None:
+                    raise ValueError(
+                        "flashinfer_mega does not implement "
+                        "activation_func_tanh_clamp_scale (SiTU-GLU); the megakernel "
+                        "only offers a hard FC1 clamp."
+                    )
+                # preprocess_mega_weights interleaves gate/up in blocks of 32.
+                if self.moe_ffn_hidden_size % 32:
+                    raise ValueError(
+                        "flashinfer_mega requires moe_ffn_hidden_size divisible by 32; "
+                        f"got {self.moe_ffn_hidden_size}."
+                    )
+                if self.num_moe_experts % self.expert_model_parallel_size:
+                    raise ValueError(
+                        "flashinfer_mega requires num_moe_experts divisible by "
+                        f"expert_model_parallel_size; got {self.num_moe_experts} and "
+                        f"{self.expert_model_parallel_size}."
+                    )
+                if self.moe_latent_size is not None:
+                    raise ValueError(
+                        "flashinfer_mega does not support latent MoE yet "
+                        "(moe_latent_size is set)."
                     )
 
             if (
