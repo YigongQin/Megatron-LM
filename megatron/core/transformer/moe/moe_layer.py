@@ -30,6 +30,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoETokenDispatcher,
 )
 from megatron.core.transformer.moe.token_dispatcher_inference import (
+    MegaLocalPassthroughDispatcher,
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
 )
@@ -401,6 +402,13 @@ class MoELayer(BaseMoELayer):
                     "inference_grouped_gemm_backend='vllm' requires Triton. "
                     "Install triton (pip install triton)."
                 )
+            elif (
+                config.inference_grouped_gemm_backend
+                == InferenceGroupedGemmBackend.FLASHINFER_MEGA
+            ):
+                from megatron.core.inference.moe.mega._deps import require_flashinfer_moe_ep
+
+                require_flashinfer_moe_ep()
             self._setup_inference_mode(pg_collection)
 
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
@@ -420,9 +428,18 @@ class MoELayer(BaseMoELayer):
         `InferenceMode.is_active()`.
         """
         dispatcher_type = self.config.inference_moe_token_dispatcher_type
-        dispatcher_cls = (
-            NVLSAllGatherVDispatcher if dispatcher_type == 'nvls' else NCCLAllGatherDispatcher
-        )
+        if (
+            self.config.inference_grouped_gemm_backend
+            == InferenceGroupedGemmBackend.FLASHINFER_MEGA
+        ):
+            # The megakernel owns EP transport, so inference_moe_token_dispatcher_type
+            # does not apply and the shared-expert overlap wiring below stays off.
+            dispatcher_type = 'mega'
+            dispatcher_cls = MegaLocalPassthroughDispatcher
+        else:
+            dispatcher_cls = (
+                NVLSAllGatherVDispatcher if dispatcher_type == 'nvls' else NCCLAllGatherDispatcher
+            )
 
         self._training_token_dispatcher = self.token_dispatcher
         self._inference_token_dispatcher = dispatcher_cls(

@@ -14,5 +14,6 @@ class InferenceGroupedGemmBackend(enum.Enum):
     """
 
     FLASHINFER = "flashinfer"
+    FLASHINFER_MEGA = "flashinfer_mega"
     TORCH = "torch"
     VLLM = "vllm"

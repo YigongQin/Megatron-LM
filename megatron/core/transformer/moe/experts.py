@@ -1192,6 +1192,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
         self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
+        self._mega_adapter = None
+        if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER_MEGA:
+            from megatron.core.inference.moe.mega import MegatronMegaMoEAdapter
+
+            self._mega_adapter = MegatronMegaMoEAdapter(config=config, ep_group=self.ep_group)
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -1430,6 +1435,20 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
         return output, None
 
+    def _mega_forward(self, hidden_states, probs, routing_map):
+        """FlashInfer moe_ep mega kernel (fused EP + expert MLP, local tokens)."""
+        assert routing_map is not None, "routing_map is required for flashinfer_mega forward."
+        assert self._mega_adapter is not None
+        assert probs.dtype == torch.float32, "flashinfer_mega requires fp32 routing probabilities."
+        output = self._mega_adapter.forward(
+            hidden_states,
+            routing_map,
+            probs,
+            self._fc1_weight,
+            self._fc2_weight,
+        )
+        return output, None
+
     def _vllm_forward(self, hidden_states, probs, routing_map):
         """vLLM Triton fused MoE kernel forward (BF16, CUDA-graph safe)."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
@@ -1501,6 +1520,10 @@ class InferenceGroupedMLP(TEGroupedMLP):
             )
         elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM:
             return self._vllm_forward(
+                permuted_local_hidden_states, permuted_probs, routing_map=routing_map
+            )
+        elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER_MEGA:
+            return self._mega_forward(
                 permuted_local_hidden_states, permuted_probs, routing_map=routing_map
             )
 
