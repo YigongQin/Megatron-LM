@@ -129,11 +129,76 @@ CLI-tunable
     --gpu-init              init experts on GPU; CPU init costs minutes at
                             model scale
     --warmup / --iters      timing loop, default 5 / 30
+    --token-sweep           global token counts -> markdown latency table
+    --geomean-from          smallest swept count in the geomean, default 8
+    --no-flush-l2           keep the L2 warm between iterations
     --vllm-dispatcher       nccl | nvls (baseline only; mega is always passthrough)
     --backend               both | vllm | flashinfer_mega
     --mega-precision        bf16 | mxfp8 | nvfp4 | fp8_fp4 (mega kernel only)
     --backend               auto | all | vllm | torch | flashinfer_mega
     --check / --check-tol   correctness mode (reference is always torch:bf16)
+
+Latency table mode (--token-sweep)
+----------------------------------
+Sweeps global token counts and prints one markdown table, the shape FlashInfer
+uses to report MegaMoE against its split baseline (flashinfer-ai/flashinfer
+PR #5019). Counts are global and split across EP ranks with the remainder going
+to the low ranks, so counts below EP deliberately leave some ranks empty --
+that skew is the decode regime, and the mega kernel has an explicit zero-token
+staging path.
+
+  torchrun --nproc_per_node=8 scripts/local/benchmark_moe_vllm_vs_mega_bf16.py \\
+      --preset dsv3 --expert-parallel-size 8 --mega-precision nvfp4 \\
+      --token-sweep flashinfer --warmup 3 --iters 100
+
+``--token-sweep flashinfer`` is shorthand for 1,2,4,...,8192, matching that
+table's 14 rows. --mega-max-tokens and the dispatcher buffers are sized from
+the largest row automatically.
+
+The reported latency per row is the median over iterations of the per-iteration
+maximum across EP ranks. The max is the right reduction because the layer is
+collective: the slowest rank sets the step latency, and a mean over ranks would
+hide EP skew. The median over iterations, rather than a mean over one wall-clock
+span, keeps one stalled iteration from setting the number. Timing uses CUDA
+events per iteration and the L2 is flushed before each one, so the expert
+weights do not stay resident across iterations.
+
+This is that table's shape, not its measurement. Do not read a row here as
+comparable to a row there; the two answer different questions.
+
+The denominator differs, which is the main thing. Their ratio is FlashInfer
+split vs FlashInfer mega, an intra-library comparison isolating the fused
+kernel. Ours is Megatron's own vllm/torch backend vs mega: what flipping
+Megatron's backend buys. Our timed region is also wider -- it includes the
+router, preprocess, the baselines' allgather/reduce-scatter and combine, none
+of which the mega path can speed up -- so our ratio is pulled toward 1 by
+construction. That dilution is the end-to-end truth, just not their number.
+
+The kernel can differ too. PR #5019's table measures Sm100_Bf16_Nvfp4 (W4A16:
+bf16 activations, fp4 weights). --mega-precision nvfp4 here selects
+Sm100_Nvfp4_Nvfp4 (W4A4), which quantizes activations as well. They are
+separate backends and not interchangeable as baselines.
+
+Smaller, but they move the absolute milliseconds:
+
+  * EP. Average per-expert rows are EP-independent (m_e ~= G*k/E), but weight
+    bytes per rank are not: at dsv3, EP4 holds 64 experts/5.25 GiB per rank
+    against EP8's 32/2.62 GiB. Once G*k >= E/EP (G >= 8 at EP4) every local
+    expert is hit, so EP4 streams twice the weights per rank for the same
+    global token count and its rows sit correspondingly higher.
+  * Routing. Their bench uses DS-V3's group-limited routing (n_group=8,
+    topk_group=4, routed_scaling=2.5); --preset dsv3 here copies the shapes
+    but keeps softmax top-k, so expert load skew differs.
+  * It runs under CUDA graphs; this runs eager. Launch overhead is therefore
+    included here and inflates the small-token rows, where the layer is
+    entirely latency-bound.
+  * It times GPU activity spans through CUPTI; this times CUDA events around
+    the host-side step, so any host gap inside the step is counted.
+  * Their hardware is B300/SM103; the PR states SM100 was not run.
+
+The last two hurt the small rows and favor neither backend, but they make the
+absolute milliseconds here larger than a graph-captured CUPTI number for the
+same kernel.
 
 Correctness mode (--check)
 --------------------------
@@ -236,7 +301,7 @@ from __future__ import annotations
 
 import argparse
 import os
-import time
+import statistics
 from typing import Optional
 
 import torch
@@ -610,19 +675,38 @@ def _report_quantization_parity(rel_rms: dict[tuple[str, str], float], rank: int
             )
 
 
-def _run_layer_benchmark(
+def _time_variant(
+    layer,
     config: TransformerConfig,
     local_tokens: int,
     warmup: int,
     iters: int,
-) -> float:
-    layer = _build_layer(config)
+    flush_l2: bool = True,
+) -> list[float]:
+    """Return per-iteration GPU milliseconds for one variant on this rank.
+
+    Takes an already-built layer so a token sweep can reuse one: the layer
+    depends only on the config, and rebuilding it per token count would re-run
+    weight init and the kernel compile for no reason.
+
+    Timed with CUDA events per iteration rather than one wall-clock span over
+    the whole loop, so the caller can reduce across ranks per iteration and
+    take a median. A mean over a single span is dominated by whichever
+    iteration happened to stall.
+
+    With flush_l2 the L2 is evicted before each iteration. At small token
+    counts the expert weights would otherwise stay resident across iterations
+    and the measurement would report a warm-cache latency no decode step ever
+    sees.
+    """
     rank = get_pg_rank(get_expert_model_parallel_group())
     torch.manual_seed(42 + rank)
     # The layer's own router produces probs/routing_map from these hidden states.
     hidden_states = torch.randn(
         local_tokens, 1, config.hidden_size, device="cuda", dtype=torch.bfloat16
     )
+    # 256 MiB comfortably exceeds Blackwell L2.
+    flush_buffer = torch.empty(64 << 20, dtype=torch.float32, device="cuda") if flush_l2 else None
 
     def _step():
         with torch.no_grad(), InferenceMode.active():
@@ -633,12 +717,198 @@ def _run_layer_benchmark(
         _step()
     torch.cuda.synchronize()
 
-    start = time.perf_counter()
-    for _ in range(iters):
+    starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    for i in range(iters):
+        if flush_buffer is not None:
+            flush_buffer.zero_()
+        starts[i].record()
         _step()
+        ends[i].record()
     torch.cuda.synchronize()
-    elapsed = time.perf_counter() - start
-    return elapsed / iters
+
+    return [starts[i].elapsed_time(ends[i]) for i in range(iters)]
+
+
+def _rank_max_median(samples: list[float]) -> float:
+    """Reduce per-iteration samples to one latency, as the FlashInfer table does.
+
+    Per iteration take the maximum across EP ranks -- the layer is collective,
+    so the slowest rank sets the step latency -- then the median over
+    iterations. Reducing after the loop rather than per iteration keeps the
+    collectives out of the timed region.
+    """
+    per_iter = torch.tensor(samples, device="cuda", dtype=torch.float64)
+    dist.all_reduce(per_iter, op=dist.ReduceOp.MAX)
+    return per_iter.median().item()
+
+
+def _local_token_share(global_tokens: int, ep_size: int, rank: int) -> int:
+    """Split global tokens across EP ranks, remainder to the low ranks.
+
+    Global counts below ep_size leave the high ranks with zero tokens, which
+    is deliberate: it is the skew a real decode step produces, and the mega
+    kernel's staging has an explicit zero-token path.
+    """
+    return global_tokens // ep_size + (1 if rank < global_tokens % ep_size else 0)
+
+
+def _format_sweep_table(
+    rows: list[tuple[int, dict[tuple[str, str], float]]],
+    variants: list[tuple[str, str]],
+    mega_key: tuple[str, str],
+    ep_size: int,
+    geomean_from: int,
+) -> str:
+    """Render the sweep as a markdown table with per-baseline ratio columns."""
+    baselines = [v for v in variants if v != mega_key]
+    labels = [f"{b}:{p}" for b, p in variants]
+    header = (
+        ["Global tokens", "Local/rank"]
+        + [f"{label} (ms)" for label in labels]
+        + [f"{b}:{p} / mega" for b, p in baselines]
+    )
+    lines = ["| " + " | ".join(header) + " |", "|" + "|".join(["---"] * len(header)) + "|"]
+
+    ratios: dict[tuple[str, str], list[float]] = {b: [] for b in baselines}
+    for global_tokens, timings in rows:
+        local = [_local_token_share(global_tokens, ep_size, r) for r in range(ep_size)]
+        local_desc = str(local[0]) if len(set(local)) == 1 else f"{min(local)}-{max(local)}"
+        cells = [str(global_tokens), local_desc]
+        for variant in variants:
+            value = timings.get(variant)
+            cells.append("n/a" if value is None else f"{value:.6f}")
+        for baseline in baselines:
+            base, mega = timings.get(baseline), timings.get(mega_key)
+            if base is None or not mega:
+                cells.append("n/a")
+                continue
+            ratio = base / mega
+            cells.append(f"{ratio:.4f}x")
+            if global_tokens >= geomean_from:
+                ratios[baseline].append(ratio)
+        lines.append("| " + " | ".join(cells) + " |")
+
+    lines.append("")
+    for baseline, values in ratios.items():
+        if not values:
+            continue
+        gm = statistics.geometric_mean(values)
+        lines.append(
+            f"Geomean over tokens >= {geomean_from} ({len(values)} rows), "
+            f"{baseline[0]}:{baseline[1]} / {mega_key[0]}:{mega_key[1]}: "
+            f"{gm:.4f}x ({(1 - 1 / gm) * 100:.2f}% lower latency for mega)"
+        )
+    return "\n".join(lines)
+
+
+def _run_token_sweep(
+    *,
+    args,
+    ep_size: int,
+    variants: list[tuple[str, str]],
+    global_tokens: list[int],
+    dispatcher_max_tokens: int,
+    build_config,
+) -> None:
+    """Time every variant across a global-token sweep and print one table."""
+    rank = get_pg_rank(get_expert_model_parallel_group())
+    mega_key = ("flashinfer_mega", args.mega_precision)
+    timings: dict[int, dict[tuple[str, str], float]] = {count: {} for count in global_tokens}
+
+    # Variants outermost, token counts inside: the layer depends only on the
+    # config -- the mega cap and dispatcher buffers are already sized for the
+    # largest row -- so it is built once per variant rather than once per row.
+    # At dsv3 each construction is 5.25 GiB of expert weight init plus a kernel
+    # compile. Looping this way also keeps only one variant's weights resident.
+    for backend, precision in variants:
+        config = build_config(backend, precision)
+        _allocate_dispatcher_buffers(config, dispatcher_max_tokens)
+        layer = _build_layer(config)
+        try:
+            for count in global_tokens:
+                local_tokens = _local_token_share(count, ep_size, rank)
+                try:
+                    samples = _time_variant(
+                        layer,
+                        config,
+                        local_tokens,
+                        args.warmup,
+                        args.iters,
+                        flush_l2=not args.no_flush_l2,
+                    )
+                except Exception as exc:
+                    # An unsupported geometry fails identically on every rank,
+                    # so all of them abandon this variant and its remaining
+                    # cells stay blank. A failure on only some ranks desyncs
+                    # the EP collectives and there is no recovery from that
+                    # here; it surfaces as an NCCL mismatch rather than a hang.
+                    if rank == 0:
+                        print(f"[sweep] {backend}:{precision} @ {count} tokens failed: {exc}")
+                    break
+                latency = _rank_max_median(samples)
+                timings[count][(backend, precision)] = latency
+                if rank == 0:
+                    print(
+                        f"[sweep] {backend}:{precision} global_tokens={count} "
+                        f"local={local_tokens} {latency:.3f}ms",
+                        flush=True,
+                    )
+        finally:
+            del layer
+            torch.cuda.empty_cache()
+
+    rows = [(count, timings[count]) for count in global_tokens]
+
+    if rank == 0:
+        print()
+        print(_workload_caption(args, ep_size))
+        print()
+        print(
+            _format_sweep_table(rows, variants, mega_key, ep_size, args.geomean_from)
+        )
+
+
+def _workload_caption(args, ep_size: int) -> str:
+    """Describe the measured geometry and timing method above the table.
+
+    The table's own columns carry only token counts and latencies, so this
+    caption is the whole provenance of a pasted result: without it a number
+    cannot be attributed to a shape, a precision or a timing method. It is
+    emitted as markdown-safe prose and is what run_mega_sweep.sh slices into
+    the saved .md.
+    """
+    experts_per_rank = args.num_experts // ep_size
+    # fc1 is gate+up, so 2*I*H, plus fc2's H*I: 3*I*H params per expert.
+    weight_bytes = experts_per_rank * 3 * args.moe_ffn_hidden_size * args.hidden_size * 2
+    if weight_bytes >= 2**30:
+        weights = f"{weight_bytes / 2**30:.2f} GiB"
+    else:
+        weights = f"{weight_bytes / 2**20:.2f} MiB"
+    geometry = f"{args.preset} " if args.preset else ""
+    return "\n".join(
+        [
+            f"Workload: {geometry}H{args.hidden_size}/I{args.moe_ffn_hidden_size}/"
+            f"E{args.num_experts}/top-k{args.topk}, EP{ep_size} "
+            f"({experts_per_rank} experts and {weights} of "
+            f"bf16 expert weights per rank), mega precision "
+            f"{args.mega_precision}. One MoELayer: router, dispatch, expert "
+            "compute and combine; no shared expert, no expert TP.",
+            "",
+            f"Per-expert GEMMs at m_e rows: FC1 [m_e, {args.hidden_size}] @ "
+            f"[{args.hidden_size}, {2 * args.moe_ffn_hidden_size}], FC2 "
+            f"[m_e, {args.moe_ffn_hidden_size}] @ "
+            f"[{args.moe_ffn_hidden_size}, {args.hidden_size}]. A rank receives "
+            f"~local_tokens*{args.topk} rows spread over its {experts_per_rank} "
+            "experts, so m_e shrinks as the token count does -- the small rows "
+            "are skinny-GEMM latency, not throughput.",
+            "",
+            f"Timing: warmup {args.warmup}, {args.iters} measured iters, "
+            f"{'cold' if not args.no_flush_l2 else 'warm'} L2, eager (no CUDA "
+            "graph). Each row is the median over iterations of the "
+            "per-iteration maximum across EP ranks, measured with CUDA events.",
+        ]
+    )
 
 
 def main() -> None:
@@ -647,6 +917,31 @@ def main() -> None:
     parser.add_argument("--local-tokens", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=30)
+    parser.add_argument(
+        "--token-sweep",
+        type=str,
+        default=None,
+        help="Comma-separated GLOBAL token counts to sweep, e.g. "
+        "'1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192'. Each count is "
+        "split across EP ranks (remainder to the low ranks, so counts below "
+        "EP leave some ranks empty). Emits one markdown latency table instead "
+        "of a single timing line. Pass 'flashinfer' for that 14-point set.",
+    )
+    parser.add_argument(
+        "--geomean-from",
+        type=int,
+        default=8,
+        help="Smallest global token count included in the sweep's geometric "
+        "mean. Rows below it are still shown. Default 8 matches the FlashInfer "
+        "table, which reports tokens 1/2/4 but excludes them.",
+    )
+    parser.add_argument(
+        "--no-flush-l2",
+        action="store_true",
+        help="Leave the L2 warm between timed iterations. Off by default: with "
+        "a warm cache the expert weights stay resident and small token counts "
+        "report a latency no real decode step sees.",
+    )
     parser.add_argument(
         "--backend",
         choices=("auto", "all", "vllm", "torch", "flashinfer_mega"),
@@ -758,9 +1053,42 @@ def main() -> None:
         expert_model_parallel_size=ep_size,
     )
 
-    max_tokens = max(args.local_tokens * 4, args.mega_max_tokens)
+    sweep_tokens: Optional[list[int]] = None
+    if args.token_sweep:
+        if args.token_sweep == "flashinfer":
+            sweep_tokens = [2**i for i in range(14)]
+        else:
+            sweep_tokens = [int(t) for t in args.token_sweep.split(",") if t.strip()]
+        # The mega per-rank cap and the dispatcher buffers must cover the
+        # largest row, so size them from the sweep rather than the flag.
+        max_local_tokens = max(
+            _local_token_share(count, ep_size, r) for count in sweep_tokens for r in range(ep_size)
+        )
+        args.mega_max_tokens = max(args.mega_max_tokens, max_local_tokens)
+    else:
+        max_local_tokens = args.local_tokens
+
+    max_tokens = max(max_local_tokens * 4, args.mega_max_tokens)
     results: dict[tuple[str, str], float] = {}
     variants = _select_variants(args.backend, args.mega_precision)
+
+    def build_config(backend: str, precision: str) -> TransformerConfig:
+        return _make_config(
+            ep_size=ep_size,
+            backend=backend,
+            # The mega path bypasses Megatron's EP gather entirely, so its
+            # dispatcher choice is irrelevant; pin it to nccl so no NVLS
+            # buffers are allocated for it.
+            dispatcher="nccl" if backend == "flashinfer_mega" else args.vllm_dispatcher,
+            hidden=args.hidden_size,
+            moe_ffn=args.moe_ffn_hidden_size,
+            mega_max_tokens=args.mega_max_tokens,
+            num_experts=args.num_experts,
+            topk=args.topk,
+            precision=precision if backend == "flashinfer_mega" else "bf16",
+            cpu_init=not args.gpu_init,
+            mcore_mxfp8=backend == "torch" and precision == "mxfp8",
+        )
 
     if args.check:
         from megatron.core.inference.moe.mega._deps import require_flashinfer_moe_ep
@@ -784,10 +1112,23 @@ def main() -> None:
         dist.destroy_process_group()
         raise SystemExit(0 if all_ok else 1)
 
+    if sweep_tokens is not None:
+        from megatron.core.inference.moe.mega._deps import require_flashinfer_moe_ep
+
+        require_flashinfer_moe_ep()
+        _run_token_sweep(
+            args=args,
+            ep_size=ep_size,
+            variants=variants,
+            global_tokens=sweep_tokens,
+            dispatcher_max_tokens=max_tokens,
+            build_config=build_config,
+        )
+        destroy_model_parallel()
+        dist.destroy_process_group()
+        return
+
     for backend, precision in variants:
-        # The mega path bypasses Megatron's EP gather entirely, so its dispatcher
-        # choice is irrelevant; pin it to nccl to avoid allocating NVLS buffers.
-        dispatcher = "nccl" if backend == "flashinfer_mega" else args.vllm_dispatcher
         if backend == "flashinfer_mega":
             try:
                 from megatron.core.inference.moe.mega._deps import require_flashinfer_moe_ep
@@ -798,19 +1139,7 @@ def main() -> None:
                     print(f"Skipping flashinfer_mega: {exc}")
                 continue
 
-        config = _make_config(
-            ep_size=ep_size,
-            backend=backend,
-            dispatcher=dispatcher,
-            hidden=args.hidden_size,
-            moe_ffn=args.moe_ffn_hidden_size,
-            mega_max_tokens=args.mega_max_tokens,
-            num_experts=args.num_experts,
-            topk=args.topk,
-            precision=precision if backend == "flashinfer_mega" else "bf16",
-            cpu_init=not args.gpu_init,
-            mcore_mxfp8=backend == "torch" and precision == "mxfp8",
-        )
+        config = build_config(backend, precision)
         if args.local_tokens > config.inference_mega_max_tokens_per_rank:
             raise SystemExit(
                 f"--local-tokens {args.local_tokens} exceeds mega cap "
@@ -818,16 +1147,25 @@ def main() -> None:
             )
 
         _allocate_dispatcher_buffers(config, max_tokens)
-        avg_s = _run_layer_benchmark(
-            config, args.local_tokens, args.warmup, args.iters
+        layer = _build_layer(config)
+        samples = _time_variant(
+            layer,
+            config,
+            args.local_tokens,
+            args.warmup,
+            args.iters,
+            flush_l2=not args.no_flush_l2,
         )
-        results[(backend, precision)] = avg_s
+        del layer
+        torch.cuda.empty_cache()
+        latency_ms = _rank_max_median(samples)
+        results[(backend, precision)] = latency_ms
         if dist.get_rank() == 0:
-            tok_per_s = args.local_tokens / avg_s
+            tok_per_s = args.local_tokens / (latency_ms / 1000)
             print(
                 f"[{backend}:{precision}] "
                 f"EP={ep_size} local_tokens={args.local_tokens} "
-                f"avg={avg_s * 1000:.3f} ms/step  ~{tok_per_s:.1f} local tok/s/rank"
+                f"median={latency_ms:.3f} ms/step  ~{tok_per_s:.1f} local tok/s/rank"
             )
 
     mega_key = ("flashinfer_mega", args.mega_precision)
