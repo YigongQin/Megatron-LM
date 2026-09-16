@@ -1195,18 +1195,30 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._mega_adapter = None
         self._mega_training_adapter = None
         self._mega_training_forward = config.moe_mega_training_forward
+        # Generation's kernel-layout copy of the expert weights, and whether it
+        # needs rebuilding. Allocated on first forward; only bf16 uses it, and
+        # only a refit marks it stale. See _mega_inference_weights.
+        self._mega_weights = None
+        self._mega_weights_stale = True
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER_MEGA:
             from megatron.core.inference.moe.mega import MegatronMegaMoEAdapter
 
-            self._mega_adapter = MegatronMegaMoEAdapter(config=config, ep_group=self.ep_group)
+            # bf16 generation owns its transformed weights so a refit can rewrite
+            # them in place; the quantized precisions let FlashInfer preprocess
+            # because that step also quantizes.
+            self._mega_adapter = MegatronMegaMoEAdapter(
+                config=config,
+                ep_group=self.ep_group,
+                owns_transformed_weights=config.inference_mega_precision == 'bf16',
+            )
             if self._mega_training_forward:
-                # Separate adapter because the two callers hand FlashInfer weights
-                # in different forms and it binds that choice at construction:
-                # inference lets it preprocess and snapshot static weights, while
-                # training supplies an already-transformed buffer that is rewritten
-                # every step. Colocated RL drives both through this one module, so
-                # both adapters have to exist. Each builds its mega layer lazily, so
-                # a training-only or inference-only job pays for just one.
+                # A second adapter even though bf16 makes both caller-owned:
+                # the adapter binds the specific weight tensors at construction,
+                # and these two read different buffers -- generation its own
+                # persistent one, training the scratch shared across layers.
+                # Colocated RL drives both through this one module, so both have
+                # to exist. Each builds its mega layer lazily, so a training-only
+                # or inference-only job pays for just one.
                 self._mega_training_adapter = MegatronMegaMoEAdapter(
                     config=config, ep_group=self.ep_group, owns_transformed_weights=True
                 )
@@ -1452,17 +1464,78 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
         return output, None
 
+    def _mega_inference_weights(self):
+        """Kernel-layout expert weights for the generation megakernel.
+
+        Returns ``(fc1, fc2)`` for the adapter, or ``None`` to let FlashInfer
+        preprocess and snapshot them itself.
+
+        BF16 owns its buffer so that a refit can rewrite it in place. The
+        quantized precisions cannot: FlashInfer's preprocessing quantizes as
+        well as reshaping, and this repack only reshapes, so they keep the
+        snapshotting path and :meth:`refresh_mega_weights` refuses rather than
+        letting generation run on pre-refit experts.
+        """
+        if self.config.inference_mega_precision != 'bf16':
+            return None
+        from megatron.core.inference.moe.mega.training_weights import MegaKernelWeightBuffer
+
+        if self._mega_weights is None:
+            self._mega_weights = MegaKernelWeightBuffer(
+                num_local_experts=self.num_local_experts,
+                hidden_size=self.config.hidden_size,
+                intermediate_size=self.config.moe_ffn_hidden_size,
+                dtype=self._fc1_weight.dtype,
+                device=self._fc1_weight.device,
+            )
+        if self._mega_weights_stale:
+            experts = range(self.num_local_experts)
+            self._mega_weights.repack(
+                [self._fc1_weight[i] for i in experts], [self._fc2_weight[i] for i in experts]
+            )
+            self._mega_weights_stale = False
+        return self._mega_weights.views()
+
+    def refresh_mega_weights(self) -> bool:
+        """Re-derive the megakernel's expert weights after a refit.
+
+        Called by the resharding refit for every module that defines it, the
+        same way ``refresh_flashinfer_mxfp8_weights`` is. Returns whether
+        anything was refreshed.
+
+        The repack is deferred to the next forward rather than done here: refit
+        runs outside generation, so there is no reason to pay it before the
+        weights are needed, and deferring keeps it off refit's critical path.
+        """
+        if self._mega_adapter is None:
+            return False
+        if self.config.inference_mega_precision != 'bf16':
+            raise NotImplementedError(
+                "Refitting expert weights under inference_mega_precision="
+                f"{self.config.inference_mega_precision!r} is not supported: FlashInfer "
+                "quantizes the weights when it preprocesses them, so the kernel's copy "
+                "cannot be rebuilt from the parameters alone and generation would keep "
+                "using the weights snapshotted before the refit. Use "
+                "inference_mega_precision='bf16' for RL, or rebuild the engine per refit."
+            )
+        self._mega_weights_stale = True
+        return True
+
     def _mega_forward(self, hidden_states, probs, routing_map):
         """FlashInfer moe_ep mega kernel (fused EP + expert MLP, local tokens)."""
         assert routing_map is not None, "routing_map is required for flashinfer_mega forward."
         assert self._mega_adapter is not None
         assert probs.dtype == torch.float32, "flashinfer_mega requires fp32 routing probabilities."
+        weights = self._mega_inference_weights()
+        fc1_weight, fc2_weight = (
+            (self._fc1_weight, self._fc2_weight) if weights is None else weights
+        )
         output = self._mega_adapter.forward(
             hidden_states,
             routing_map,
             probs,
-            self._fc1_weight,
-            self._fc2_weight,
+            fc1_weight,
+            fc2_weight,
         )
         return output, None
 
