@@ -255,6 +255,12 @@ class MoELayer(BaseMoELayer):
             config.recompute_granularity == 'selective'
             and "shared_experts" in config.recompute_modules
         )
+        # Train/generation parity mode: the mega kernel produces the layer output
+        # and the recompute pass produces the backward graph, so the two passes of
+        # the same checkpointed forward run different expert implementations and
+        # different token dispatchers. True only during the output-producing pass.
+        self.mega_training_forward = config.moe_mega_training_forward
+        self._mega_pass_is_value = False
 
         self.tp_group = pg_collection.tp
 
@@ -585,7 +591,14 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        if hasattr(self, "_inference_token_dispatcher") and InferenceMode.is_active():
+        # The mega kernel does its own routing, so it needs the routing map rather
+        # than pre-permuted tokens. True for inference and for the value pass of
+        # the parity-mode training forward.
+        needs_routing_map = hasattr(self, "_inference_token_dispatcher") and (
+            InferenceMode.is_active()
+            or isinstance(self.token_dispatcher, MegaLocalPassthroughDispatcher)
+        )
+        if needs_routing_map:
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
@@ -696,6 +709,22 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+            if self.mega_training_forward and self.training:
+                # The mega kernel consumes undispatched local tokens and does its
+                # own EP transport, so the value pass bypasses dispatch/combine
+                # while the recompute pass needs the real ones to build wgrad.
+                use_mega = self._mega_pass_is_value
+                self.token_dispatcher = (
+                    self._inference_token_dispatcher
+                    if use_mega
+                    else self._training_token_dispatcher
+                )
+                self.shared_expert_overlap = (
+                    False if use_mega else self.config.moe_shared_expert_overlap
+                )
+                self.experts._in_mega_recompute = not use_mega
+                # Consumed: any later invocation of this closure is a recompute.
+                self._mega_pass_is_value = False
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
@@ -737,6 +766,11 @@ class MoELayer(BaseMoELayer):
                     return output
 
             return output, mlp_bias
+
+        # Mark the next custom_forward invocation as the output-producing pass.
+        # custom_forward clears this, so the recompute triggered from backward
+        # takes the TE path.
+        self._mega_pass_is_value = self.mega_training_forward and self.training
 
         if self.moe_layer_recompute and self.training:
             if self.config.fp8 or self.config.fp4:

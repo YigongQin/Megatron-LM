@@ -683,7 +683,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
 
 
 class MegaLocalPassthroughDispatcher(NCCLAllGatherDispatcher):
-    """Inference dispatcher for FlashInfer mega MoE.
+    """Dispatcher for FlashInfer mega MoE, in inference and in parity-mode training.
 
     Tokens stay on the local EP rank; cross-rank movement is fused inside the
     FlashInfer mega kernel, so Megatron's NCCL/NVLS gather/scatter must not run.
@@ -699,7 +699,14 @@ class MegaLocalPassthroughDispatcher(NCCLAllGatherDispatcher):
     def token_dispatch(self, hidden_states, probs):
         """No-op transport; record the local token count for the fused kernels."""
         local_tokens = hidden_states.shape[0]
-        if self._runs_metadata_sync:
+        # The valid-tokens scalar is allocated by the inference context, so it is
+        # absent when this dispatcher runs the value pass of a parity-mode
+        # training forward (config.moe_mega_training_forward). Nothing on the mega
+        # path reads it — the megakernel takes the routing map directly — so skip
+        # the bookkeeping rather than allocating inference state during training.
+        if self._runs_metadata_sync and (
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor is not None
+        ):
             InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(local_tokens)
         InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = local_tokens
         return hidden_states, probs
