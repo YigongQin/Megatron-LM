@@ -341,6 +341,17 @@ def _measure_token_count_parity(batched, chunked, label):
     return error, worst_differed
 
 
+
+def _measure_scalar(value, label):
+    """Reduce and report one already-computed number, the way _measure does tensors."""
+    stats = torch.tensor([value], device="cuda", dtype=torch.float64)
+    torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.MAX)
+    worst = stats[0].item()
+    if torch.distributed.get_rank() == 0:
+        print(f"[mega-metric] {label}: rel_rms={worst:.3e}", flush=True)
+    return worst
+
+
 @pytest.fixture(autouse=True)
 def _parallel_state():
     from megatron.core.transformer.moe.token_dispatcher_inference import (
@@ -1159,3 +1170,669 @@ class TestWholeTransformerLayer:
 
         error = _measure(mega_out, te_out, "whole layer: mega vs TE")
         assert error < self.BLOCK_TOL, f"layer output diverges from TE: rel_rms={error:.3e}"
+
+
+def _capture_routing(layer, for_inference: bool):
+    """Record the routing indices this layer hands the kernel.
+
+    Both paths funnel through ``adapter.forward(hidden, routing_map, probs, ...)``,
+    so wrapping it captures exactly what the kernel selects -- after
+    InferenceTopKRouter's topk on one side and after
+    ``_mega_dense_routing_to_topk`` recovers the set from TopKRouter's boolean
+    map on the other. Comparing anything earlier would compare two different
+    representations; comparing the outputs alone cannot say whether a
+    disagreement is a different expert or different arithmetic.
+    """
+    experts = layer.experts
+    adapter = experts._mega_adapter if for_inference else experts._mega_training_adapter
+    captured = []
+    original = adapter.forward
+
+    def capturing(hidden_states, routing_map, probs, *args, **kwargs):
+        captured.append(routing_map.detach().clone())
+        return original(hidden_states, routing_map, probs, *args, **kwargs)
+
+    adapter.forward = capturing
+    return captured
+
+
+def _routing_disagreements(gen_indices, train_indices):
+    """Count tokens whose selected expert *set* differs.
+
+    Sets, not sequences: order is known not to matter -- the kernel's combine
+    was bitwise invariant under permutation at topk=8 -- so comparing the
+    indices elementwise would report differences the output cannot see, and
+    hide nothing that it can.
+    """
+    gen_sorted = gen_indices.sort(dim=-1).values
+    train_sorted = train_indices.sort(dim=-1).values
+    per_token = (gen_sorted != train_sorted).any(dim=-1)
+    return int(per_token.sum().item()), per_token
+
+
+def _perturb_router(layer, scale, seed):
+    """Nudge the router, the way an optimizer step does and a uniform bump does not.
+
+    ``_bump_expert_weights`` adds one delta to every expert, which leaves every
+    router score shifted by the same amount and so cannot change what the top-k
+    selects. A step-2 divergence needs the *relative* order of scores to move,
+    which takes per-element noise on the router itself.
+    """
+    with torch.no_grad():
+        for name, param in layer.named_parameters():
+            if "router" in name:
+                generator = torch.Generator(device=param.device).manual_seed(seed)
+                noise = torch.randn(
+                    param.shape, device=param.device, dtype=param.dtype, generator=generator
+                )
+                param.add_(noise * scale)
+
+
+def _tie_the_router(layer):
+    """Make experts tie exactly, in pairs.
+
+    A near-tie is what the e2e run is suspected of hitting, and waiting for one
+    to appear by chance is a test that passes for the wrong reason. Duplicating
+    router rows makes every even/odd expert pair score identically for every
+    token, so the top-k boundary is ambiguous on purpose and the two
+    implementations have to break it the same way to agree.
+    """
+    with torch.no_grad():
+        for name, param in layer.named_parameters():
+            if "router" in name and param.dim() == 2:
+                param[1::2] = param[0::2]
+
+
+class TestParityAfterARouterUpdate:
+    """(6) The step-2 gap from the RL pipeclean, brought down to one layer.
+
+    The run scored 2048/2048 tokens bitwise equal at step 1 and lost 125 of
+    them at step 2 -- concentrated in 2 of 8 sequences, with an onset point and
+    a worst case of 0.26 nats, which is the size of a token being sent to a
+    different expert rather than of arithmetic drift.
+
+    Nothing above can see that. Every parity test runs on freshly initialized
+    weights, where router scores are well separated, and the one test that does
+    perturb weights adds a single delta to every expert -- which shifts all
+    router scores equally and cannot reorder them. These reproduce the two
+    candidate mechanisms directly: a selection that disagrees once scores move,
+    and a selection that disagrees when scores tie.
+    """
+
+    # Wide enough that a per-token event of order 1e-3 is likely to appear at
+    # least once, which the 8-token default cannot do.
+    TOKENS = int(os.environ.get("MEGA_TEST_UPDATE_TOKENS", "2048"))
+    # Small next to the initialization, large next to an ULP: the regime an
+    # optimizer step leaves the router in after a handful of updates.
+    NOISE = float(os.environ.get("MEGA_TEST_ROUTER_NOISE", "0.02"))
+
+    def _layers(self):
+        """A generation layer and a training layer with bit-identical weights."""
+        capacity = self.TOKENS
+        gen = _build_layer(
+            _config(mega_training=False, inference_mega_max_tokens_per_rank=capacity),
+            for_inference=True,
+        )
+        train = _build_layer(
+            _config(mega_training=True, inference_mega_max_tokens_per_rank=capacity)
+        ).train()
+        return gen, train
+
+    def _run_both(self, gen, train, hidden):
+        gen_routing = _capture_routing(gen, for_inference=True)
+        train_routing = _capture_routing(train, for_inference=False)
+        with torch.no_grad():
+            with InferenceMode.active():
+                gen_out, _ = gen(hidden)
+            train_out, _ = train(hidden)
+        assert gen_routing and train_routing, "adapter was not reached; mega path inactive"
+        return gen_out, train_out, gen_routing[0], train_routing[0]
+
+    def test_routing_and_output_agree_after_a_router_update(self):
+        """Perturb the router on both sides identically, then compare."""
+        gen, train = self._layers()
+        _perturb_router(train, scale=self.NOISE, seed=17)
+        # Copied after the perturbation, so both sides hold the same bits. A
+        # difference here would be the test's own doing, not the kernel's.
+        _copy_expert_weights(train, gen)
+
+        hidden = _hidden(train.config, seed=18, tokens=self.TOKENS)
+        gen_out, train_out, gen_idx, train_idx = self._run_both(gen, train, hidden)
+
+        disagreed, mask = _routing_disagreements(gen_idx, train_idx)
+        error = _rel_rms(train_out, gen_out)
+        stats = torch.tensor([disagreed, error], device="cuda", dtype=torch.float64)
+        torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.MAX)
+        disagreed, error = int(stats[0].item()), stats[1].item()
+
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[mega-metric] post-update routing: {disagreed}/{self.TOKENS} tokens "
+                f"disagree, output rel_rms={error:.3e}",
+                flush=True,
+            )
+        assert disagreed == 0, (
+            f"{disagreed}/{self.TOKENS} tokens routed to different experts after a "
+            "router update. This is the step-2 e2e divergence, reproduced: the two "
+            "top-k implementations disagree once scores are no longer well separated."
+        )
+        assert error < 1e-6, (
+            f"output differs after a router update despite identical routing: "
+            f"rel_rms={error:.3e}. Routing agrees, so this is the kernel, not selection."
+        )
+
+    def test_routing_agrees_when_router_scores_tie(self):
+        """Force exact ties rather than waiting for one to occur by chance."""
+        gen, train = self._layers()
+        _tie_the_router(train)
+        _copy_expert_weights(train, gen)
+
+        hidden = _hidden(train.config, seed=19, tokens=self.TOKENS)
+        _, _, gen_idx, train_idx = self._run_both(gen, train, hidden)
+
+        disagreed, _ = _routing_disagreements(gen_idx, train_idx)
+        stats = torch.tensor([disagreed], device="cuda", dtype=torch.float64)
+        torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.MAX)
+        disagreed = int(stats[0].item())
+
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[mega-metric] tied-score routing: {disagreed}/{self.TOKENS} tokens disagree",
+                flush=True,
+            )
+        assert disagreed == 0, (
+            f"{disagreed}/{self.TOKENS} tokens routed differently when experts tie. "
+            "TopKRouter's boolean map and InferenceTopKRouter's topk break exact ties "
+            "differently; the two paths must agree by construction, not by luck."
+        )
+
+    def test_batched_and_chunked_generation_agree_after_an_update(self):
+        """The other candidate: token grouping, in the post-update regime.
+
+        Generation saw sequence 3 a few decode tokens at a time while the
+        log-prob pass saw all 512 at once. Batch invariance was only ever
+        checked on unperturbed weights, where routing is not near a boundary.
+        """
+        gen, train = self._layers()
+        _perturb_router(train, scale=self.NOISE, seed=20)
+        _copy_expert_weights(train, gen)
+
+        hidden = _hidden(train.config, seed=21, tokens=self.TOKENS)
+        with torch.no_grad(), InferenceMode.active():
+            batched, _ = gen(hidden)
+        # GEN_TOKENS, not a literal: the shared helper prints that constant as the
+        # chunk width, so any other value makes the metric line describe a run
+        # that did not happen.
+        chunked = _chunked_generation(gen, hidden, chunk=GEN_TOKENS)
+
+        error, differed = _measure_token_count_parity(
+            batched, chunked, f"post-update gen batched vs chunked({GEN_TOKENS})"
+        )
+        # Asserting on the token count as well as the rms: an rms over 2048
+        # tokens dilutes the handful of badly wrong ones this is looking for,
+        # which is exactly the shape the e2e run showed.
+        assert differed == 0 and error < 1e-6, (
+            f"generation depends on token grouping after a router update: "
+            f"{differed}/{self.TOKENS} tokens differ, rel_rms={error:.3e}. Decode-sized "
+            "launches and one wide launch disagree, which is the other way the e2e "
+            "log-prob pass can diverge from the rollout."
+        )
+
+
+class TestRefitReachesTheKernelAfterGenerationHasRun:
+    """(7) The refit ordering the e2e run has and the tests above do not.
+
+    The pipeclean scored 0 KL at step 1 and 8e-5 at step 2, against 1e-14 for
+    the TE arm on the same recipe. Step 1 is the step at which no optimizer
+    step has happened yet, which is exactly when serving stale weights is
+    indistinguishable from serving correct ones, so "generation is one update
+    behind" fits the shape of that result.
+
+    ``InferenceGroupedMLP`` may copy the per-expert parameters into one
+    contiguous ``_fc1_weight`` on first use and repoint ``param.data`` at views
+    of it. A refit resolving its destination through the ``nn.Parameter``
+    follows that redirect; one holding the pre-redirect tensor writes to
+    storage nothing reads any more. RL's first refit runs before the first
+    rollout, so its plan -- cached and reused -- is built while the parameters
+    still own their original storage.
+
+    The reference here is built from the weights the refit *intended* to
+    install, not from the layer's own state afterwards. Deriving it from the
+    layer is how the first version of this test reported agreement in both
+    arms: a write that never landed leaves reference and layer equally stale.
+    """
+
+    BUMP = 0.05
+
+    def _gen_layer(self):
+        return _build_layer(_config(mega_training=False), for_inference=True)
+
+    def _expert_params(self, experts):
+        return [
+            getattr(experts.linear_fc1, f"weight{i}")
+            for i in range(experts.num_local_experts)
+        ]
+
+    def _intended_output(self, snapshot, hidden):
+        """A layer holding exactly the weights the refit meant to install.
+
+        Built and bumped before its own first forward, while the parameters
+        still own their storage, so this arm cannot be affected by the
+        redirect it is being used to detect.
+        """
+        reference = self._gen_layer()
+        reference.load_state_dict(snapshot)
+        with torch.no_grad():
+            for param in self._expert_params(reference.experts):
+                param.data.add_(self.BUMP)
+        with torch.no_grad(), InferenceMode.active():
+            out, _ = reference(hidden)
+        return out
+
+    def _refit_and_compare(self, write_through_parameter: bool):
+        layer = self._gen_layer()
+        experts = layer.experts
+        hidden = _hidden(layer.config, seed=31)
+        snapshot = {k: v.clone() for k, v in layer.state_dict().items()}
+
+        # Captured before any forward, which is when RL's plan is built: the
+        # first refit precedes the first rollout.
+        params = self._expert_params(experts)
+        pre_redirect = [p.data for p in params]
+        pre_ptrs = [t.data_ptr() for t in pre_redirect]
+
+        # The rollout, which is what would trigger the redirect.
+        with torch.no_grad(), InferenceMode.active():
+            layer(hidden)
+
+        redirected = [p.data_ptr() for p in params] != pre_ptrs
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[mega-metric] rollout redirected param.data: {redirected} "
+                f"(_fc1_weight buffer: {hasattr(experts, '_fc1_weight')})",
+                flush=True,
+            )
+
+        with torch.no_grad():
+            for param, pre in zip(params, pre_redirect):
+                (param.data if write_through_parameter else pre).add_(self.BUMP)
+
+        refresh = getattr(experts, "refresh_mega_weights", None)
+        assert refresh is not None, "refresh_mega_weights missing; refit cannot reach the kernel"
+        refresh()
+
+        with torch.no_grad(), InferenceMode.active():
+            after, _ = layer(hidden)
+        return _rel_rms(after, self._intended_output(snapshot, hidden)), redirected
+
+    def test_refit_through_the_parameter_reaches_the_kernel(self):
+        """The good case, and the one the e2e path needs to be taking."""
+        error, _ = self._refit_and_compare(write_through_parameter=True)
+        error = _measure_scalar(error, "refit via nn.Parameter after a rollout")
+        assert error < 1e-6, (
+            f"a refit written through param.data after generation has run does not "
+            f"reach the kernel: rel_rms={error:.3e}. Generation would serve the "
+            f"previous step's expert weights, which is the e2e signature."
+        )
+
+    def test_a_refit_holding_pre_redirect_storage_would_be_caught(self):
+        """Whether the pre-redirect tensor is still the one the kernel reads.
+
+        This is diagnostic rather than a correctness requirement: it decides
+        whether a cached plan built before the first rollout can go stale. If
+        the rollout never redirects ``param.data`` the question is moot, and
+        the test says so instead of asserting something that does not apply.
+        """
+        error, redirected = self._refit_and_compare(write_through_parameter=False)
+        error = _measure_scalar(error, "refit via pre-redirect storage after a rollout")
+        if not redirected:
+            pytest.skip(
+                "the rollout does not repoint param.data, so a plan built before it "
+                "cannot hold orphaned storage and this cannot explain the e2e gap"
+            )
+        assert error > 1e-6, (
+            "param.data was repointed by the rollout, yet writing to the pre-redirect "
+            "tensor still reached the kernel. That combination is not expected; "
+            "re-read the redirect before trusting either arm of this class."
+        )
+
+
+def _boundary_gap_stats(layer, hidden):
+    """How often the top-k boundary is too close to call.
+
+    Two experts whose router scores differ by less than the score's own
+    representation can resolve are a coin flip, and a flip sends the token to a
+    different expert. The gap between the k-th and (k+1)-th score is that coin.
+
+    This is the quantity that scales with expert count, and the reason the
+    tests above cannot speak to the e2e run: top-8-of-16 puts the boundary at
+    the median of the score distribution, where scores are far apart, while
+    top-8-of-128 puts it in the packed tail. Same topk, different regime.
+    """
+    flat = hidden.reshape(-1, hidden.shape[-1])
+    logits = F.linear(flat.float(), layer.router.weight.float())
+    scores = torch.softmax(logits, dim=-1)
+    top = scores.topk(ROUTER_TOPK + 1, dim=-1).values
+    relative = (top[:, -2] - top[:, -1]) / top[:, -2].abs().clamp_min(1e-30)
+    # bf16 carries 8 mantissa bits; below that the two scores are the same number.
+    return int((relative <= 2.0**-8).sum().item()), relative.numel(), relative
+
+
+class TestRoutingAtTheProductionExpertCount:
+    """(8) The same parity question, at the expert count the e2e run uses.
+
+    Every test above runs 16 experts because it is fast, and that choice turns
+    out to decide the answer rather than just the runtime. The e2e model routes
+    top-8 of 128. The suspected mechanism -- two experts scoring close enough
+    at the selection boundary that the two paths can order them differently --
+    has a rate that depends entirely on how crowded that boundary is, so a
+    16-expert test can report zero disagreements no matter whether the
+    mechanism is real.
+
+    One build, many cheap trials: the layer construction is what costs seconds,
+    while a fresh hidden state and two forwards cost milliseconds, so the token
+    count this samples is set by the loop rather than by the clock.
+
+    Reports the boundary-gap density alongside the disagreement count. If the
+    density here is far below what 128 experts produce in the real model, a
+    clean result means the test still has not reached the regime, and saying so
+    is more useful than the pass.
+    """
+
+    EXPERTS = int(os.environ.get("MEGA_TEST_PROD_EXPERTS", "128"))
+    TOKENS = int(os.environ.get("MEGA_TEST_PROD_TOKENS", "2048"))
+    TRIALS = int(os.environ.get("MEGA_TEST_PROD_TRIALS", "6"))
+    NOISE = float(os.environ.get("MEGA_TEST_ROUTER_NOISE", "0.02"))
+
+    def test_routing_agrees_when_the_boundary_is_crowded(self):
+        if self.EXPERTS % EP_SIZE:
+            pytest.skip(f"{self.EXPERTS} experts do not divide EP={EP_SIZE}")
+
+        shape = dict(
+            num_moe_experts=self.EXPERTS,
+            inference_mega_max_tokens_per_rank=self.TOKENS,
+        )
+        gen = _build_layer(_config(mega_training=False, **shape), for_inference=True)
+        train = _build_layer(_config(mega_training=True, **shape)).train()
+
+        disagreed_total = 0
+        worst_output = 0.0
+        unresolvable = 0
+        boundary_total = 0
+        medians = []
+
+        for trial in range(self.TRIALS):
+            # A fresh router draw per trial, then copied across, so each trial
+            # is an independent sample of the boundary rather than the same
+            # weights seen again with new inputs.
+            _perturb_router(train, scale=self.NOISE, seed=1000 + trial)
+            _copy_expert_weights(train, gen)
+            hidden = _hidden(train.config, seed=2000 + trial, tokens=self.TOKENS)
+
+            gen_adapter = gen.experts._mega_adapter
+            train_adapter = train.experts._mega_training_adapter
+            gen_saved, train_saved = gen_adapter.forward, train_adapter.forward
+            gen_seen, train_seen = [], []
+
+            def capture(original, sink):
+                def wrapper(hidden_states, routing_map, probs, *args, **kwargs):
+                    sink.append(routing_map.detach().clone())
+                    return original(hidden_states, routing_map, probs, *args, **kwargs)
+
+                return wrapper
+
+            gen_adapter.forward = capture(gen_saved, gen_seen)
+            train_adapter.forward = capture(train_saved, train_seen)
+            try:
+                with torch.no_grad():
+                    with InferenceMode.active():
+                        gen_out, _ = gen(hidden)
+                    train_out, _ = train(hidden)
+            finally:
+                # Restored every trial; leaving the wrappers in place would
+                # stack one per trial and time the kernel through six of them.
+                gen_adapter.forward, train_adapter.forward = gen_saved, train_saved
+
+            assert gen_seen and train_seen, "adapter was not reached; mega path inactive"
+            differed, _ = _routing_disagreements(gen_seen[0], train_seen[0])
+            disagreed_total += differed
+            worst_output = max(worst_output, _rel_rms(train_out, gen_out))
+
+            close, count, relative = _boundary_gap_stats(train, hidden)
+            unresolvable += close
+            boundary_total += count
+            medians.append(relative.median().item())
+
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[mega-metric] boundary at {self.EXPERTS} experts: "
+                f"{unresolvable}/{boundary_total} token-boundaries below bf16 resolution "
+                f"({100.0 * unresolvable / max(boundary_total, 1):.3f}%), "
+                f"median relative gap={sum(medians) / len(medians):.2e}",
+                flush=True,
+            )
+            print(
+                f"[mega-metric] routing at {self.EXPERTS} experts: "
+                f"{disagreed_total} tokens differ over "
+                f"{self.TRIALS * self.TOKENS} sampled",
+                flush=True,
+            )
+        worst_output = _measure_scalar(
+            worst_output, f"train/gen output at {self.EXPERTS} experts"
+        )
+
+        assert disagreed_total == 0, (
+            f"{disagreed_total} of {self.TRIALS * self.TOKENS} tokens routed differently at "
+            f"{self.EXPERTS} experts, against 0 at {NUM_EXPERTS}. This is the e2e mechanism "
+            "reproduced: the selection boundary is crowded enough that the two paths order "
+            "it differently, and one token going to a different expert is worth the 0.26 "
+            "nats the run showed."
+        )
+        assert worst_output < 1e-6, (
+            f"routing agrees at {self.EXPERTS} experts but the outputs do not: "
+            f"rel_rms={worst_output:.3e}. The divergence is arithmetic, not selection."
+        )
+
+
+def _skew_router(layer, strength, seed):
+    """Bias the router per expert so occupancy comes out ragged, not balanced.
+
+    ``_perturb_router`` adds independent noise, which leaves the expert
+    *marginals* roughly uniform: every expert still draws about the same number
+    of tokens. A shared shift along an expert's whole row moves that expert's
+    logit for every token at once, so some experts take most of the traffic and
+    others take none -- which is what the real model's routing looks like and
+    what decides how the kernel tiles each expert's GEMM.
+    """
+    with torch.no_grad():
+        for name, param in layer.named_parameters():
+            if "router" in name and param.dim() == 2:
+                generator = torch.Generator(device=param.device).manual_seed(seed)
+                bias = torch.randn(
+                    (param.shape[0], 1),
+                    device=param.device,
+                    dtype=param.dtype,
+                    generator=generator,
+                )
+                param.add_(bias * strength)
+
+
+def _expert_occupancy(indices, num_experts):
+    """Tokens per expert for one launch: the quantity the kernel tiles over."""
+    counts = torch.bincount(indices.reshape(-1).long(), minlength=num_experts)
+    nonzero = counts[counts > 0]
+    return {
+        "max": int(counts.max().item()),
+        "median": int(nonzero.median().item()) if nonzero.numel() else 0,
+        "empty": int((counts == 0).sum().item()),
+    }
+
+
+class TestRaggedExpertOccupancy:
+    """(9) Per-expert occupancy, which is the axis no test above varies.
+
+    ``test_parity_holds_across_token_counts`` varies the *total* token count
+    and finds bitwise equality, so the kernel is not sensitive to launch width
+    as such. But it feeds uniform random hidden states, which route evenly:
+    2048 tokens over 16 experts leaves every expert near 1024, smooth and
+    tail-free on every trial. Total width and per-expert occupancy are
+    different variables, and only the first has been tested.
+
+    The real run is nowhere near that. Decode is 8 tokens of top-8 over 128
+    experts at EP=8, so most experts receive nothing and the rest receive one
+    or two; the scoring pass puts ~23 in each. Both are ragged, neither
+    resembles 1024, and the two differ from each other -- which is precisely
+    the comparison the e2e KL is made of.
+
+    Ragged occupancy also matches the signature in a way launch width does not.
+    A tail that is mishandled at particular occupancies fires for some
+    sequences and not others sharing a prompt, hits one token, and lets causal
+    attention carry it forward: per-sequence, with an onset, growing after.
+    Sensitivity to launch width would instead move every token in the launch,
+    which the six bitwise-clean sequences rule out.
+
+    So this compares one wide teacher-forced launch against the same tokens
+    replayed at decode width, under router skews that sweep occupancy from
+    balanced to concentrated.
+    """
+
+    EXPERTS = int(os.environ.get("MEGA_TEST_PROD_EXPERTS", "128"))
+    TOKENS = int(os.environ.get("MEGA_TEST_RAGGED_TOKENS", "256"))
+    # The rollout's decode width. Comparing against this is what makes the
+    # occupancy on the two sides differ rather than merely be ragged.
+    CHUNK = int(os.environ.get("MEGA_TEST_RAGGED_CHUNK", "8"))
+    # Balanced, moderately concentrated, and heavily concentrated.
+    SKEWS = tuple(
+        float(x) for x in os.environ.get("MEGA_TEST_RAGGED_SKEWS", "0,2,6").split(",")
+    )
+
+    def _attribute(self, scored, replayed, train_indices, gen_chunks, skew):
+        """Report the expert set and both occupancies for each disagreeing token.
+
+        The token's experts are the same on both sides, so what is left to
+        report is the only thing that differs: how many tokens shared those
+        experts in each launch. ``m_wide`` is the count in the single scoring
+        launch, ``m_decode`` the count in the chunk that recomputed the token.
+        Those two numbers are the input the kernel tiles from, so they are what
+        an upstream report needs.
+        """
+        try:
+            gen_indices = torch.cat(gen_chunks, dim=0)
+            differing = (scored - replayed).abs().flatten(1).sum(dim=1).nonzero().flatten()
+            if differing.numel() == 0 or train_indices.shape[0] != gen_indices.shape[0]:
+                return
+            rerouted, _ = _routing_disagreements(
+                gen_indices[differing], train_indices[differing]
+            )
+            if torch.distributed.get_rank() != 0:
+                return
+
+            verdict = "selection" if rerouted else "arithmetic (same experts)"
+            print(
+                f"[mega-metric] attribution at skew={skew}: "
+                f"{rerouted}/{differing.numel()} disagreeing tokens rerouted -> {verdict}",
+                flush=True,
+            )
+
+            wide = torch.bincount(
+                train_indices.reshape(-1).long(), minlength=self.EXPERTS
+            )
+            for token in differing[:3].tolist():
+                experts = sorted(set(train_indices[token].reshape(-1).long().tolist()))
+                chunk = gen_chunks[token // self.CHUNK]
+                decode = torch.bincount(chunk.reshape(-1).long(), minlength=self.EXPERTS)
+                print(
+                    f"[mega-metric]   token {token}: experts={experts} "
+                    f"m_wide={[int(wide[e]) for e in experts]} "
+                    f"m_decode={[int(decode[e]) for e in experts]}",
+                    flush=True,
+                )
+        except Exception as error:  # diagnostics must not mask the assertion
+            if torch.distributed.get_rank() == 0:
+                print(f"[mega-metric] attribution unavailable: {error!r}", flush=True)
+
+    def test_generation_matches_scoring_under_ragged_occupancy(self):
+        if self.EXPERTS % EP_SIZE:
+            pytest.skip(f"{self.EXPERTS} experts do not divide EP={EP_SIZE}")
+
+        shape = dict(
+            num_moe_experts=self.EXPERTS,
+            inference_mega_max_tokens_per_rank=self.TOKENS,
+        )
+        gen = _build_layer(_config(mega_training=False, **shape), for_inference=True)
+        train = _build_layer(_config(mega_training=True, **shape)).train()
+
+        worst = 0.0
+        differed_total = 0
+        for index, skew in enumerate(self.SKEWS):
+            _skew_router(train, strength=skew, seed=400 + index)
+            _copy_expert_weights(train, gen)
+            hidden = _hidden(train.config, seed=500 + index, tokens=self.TOKENS)
+
+            adapter = train.experts._mega_training_adapter
+            saved = adapter.forward
+            seen = []
+
+            def capturing(hidden_states, routing_map, probs, *args, **kwargs):
+                seen.append(routing_map.detach().clone())
+                return saved(hidden_states, routing_map, probs, *args, **kwargs)
+
+            adapter.forward = capturing
+            try:
+                with torch.no_grad():
+                    scored, _ = train(hidden)
+            finally:
+                adapter.forward = saved
+
+            # The rollout side: the same tokens, at decode width. Routing is
+            # captured per chunk and reassembled so a disagreeing token can be
+            # attributed -- a different expert set and the same expert set
+            # computed differently are different bugs with different fixes,
+            # and the output alone cannot tell them apart.
+            gen_adapter = gen.experts._mega_adapter
+            gen_saved = gen_adapter.forward
+            gen_seen = []
+
+            def gen_capturing(hidden_states, routing_map, probs, *args, **kwargs):
+                gen_seen.append(routing_map.detach().clone())
+                return gen_saved(hidden_states, routing_map, probs, *args, **kwargs)
+
+            gen_adapter.forward = gen_capturing
+            try:
+                replayed = _chunked_generation(gen, hidden, chunk=self.CHUNK)
+            finally:
+                gen_adapter.forward = gen_saved
+
+            error, differed = _measure_token_count_parity(
+                scored, replayed, f"scoring vs decode-width replay (skew={skew})"
+            )
+            worst = max(worst, error)
+            differed_total += differed
+
+            if differed and seen and gen_seen:
+                self._attribute(scored, replayed, seen[0], gen_seen, skew)
+
+            if seen and gen_seen and torch.distributed.get_rank() == 0:
+                wide = _expert_occupancy(seen[0], self.EXPERTS)
+                # Per chunk, then worst/typical across chunks: the decode side
+                # is 32 separate launches, and one aggregate over all of them
+                # would describe a launch that never happened.
+                per_chunk = [_expert_occupancy(c, self.EXPERTS) for c in gen_seen]
+                print(
+                    f"[mega-metric] occupancy at skew={skew}: "
+                    f"wide(T={self.TOKENS}) max={wide['max']} median={wide['median']} "
+                    f"empty={wide['empty']}/{self.EXPERTS} | "
+                    f"decode(T={self.CHUNK}) max={max(c['max'] for c in per_chunk)} "
+                    f"median={sorted(c['median'] for c in per_chunk)[len(per_chunk) // 2]} "
+                    f"empty={min(c['empty'] for c in per_chunk)}-"
+                    f"{max(c['empty'] for c in per_chunk)}/{self.EXPERTS}",
+                    flush=True,
+                )
+
+        assert differed_total == 0 and worst < 1e-6, (
+            f"{differed_total} tokens differ between one wide scoring launch and the same "
+            f"tokens at decode width (rel_rms={worst:.3e}) once expert occupancy is ragged. "
+            "This is the e2e comparison in miniature: the rollout computes a token at decode "
+            "occupancy and the log-prob pass recomputes it at scoring occupancy, and a token "
+            "that disagrees there is one the KL will show."
+        )

@@ -13,6 +13,7 @@
 #   FI_OVERLAY=0 PHASES=gen ./scripts/local/...  # against the venv's flashinfer
 #   PHASES=parity ./scripts/local/run_mega_training_tests.sh
 #   PHASES=block ./scripts/local/run_mega_training_tests.sh  # whole transformer layer
+#   PHASES=update ./scripts/local/run_mega_training_tests.sh # post-update parity (RL step-2 repro)
 #   PARITY_RUNS=10 ./scripts/local/run_mega_training_tests.sh
 #   PHASES=all ./scripts/local/run_mega_training_tests.sh   # + attribution
 #   BI=0 PHASES=parity ./scripts/local/run_mega_training_tests.sh
@@ -230,6 +231,33 @@ for phase in $PHASES; do
             selector="-k 'TestWholeTransformerLayer'"
             launches=1
             ;;
+        # Reproduction of the RL step-2 divergence: parity after the router moves,
+        # which every other phase misses by testing only freshly built weights.
+        # Reports which mechanism -- routing selection or token grouping.
+        update)
+            ranks=$GPUS
+            target=$FORWARD
+            selector="-k 'TestParityAfterARouterUpdate'"
+            launches=${UPDATE_RUNS:-3}
+            ;;
+        ragged)
+            ranks=$GPUS
+            target=$FORWARD
+            selector="-k 'TestRaggedExpertOccupancy'"
+            launches=1
+            ;;
+        ties)
+            ranks=$GPUS
+            target=$FORWARD
+            selector="-k 'TestRoutingAtTheProductionExpertCount'"
+            launches=1
+            ;;
+        refit)
+            ranks=$GPUS
+            target=$FORWARD
+            selector="-k 'TestRefitReachesTheKernelAfterGenerationHasRun'"
+            launches=1
+            ;;
         attribution)
             ranks=$GPUS
             target=$FORWARD
@@ -244,7 +272,7 @@ for phase in $PHASES; do
             launches=1
             ;;
         *)
-            echo "unknown phase=$phase (weights|parity|loop|gen|block|attribution|forward|all)" >&2
+            echo "unknown phase=$phase (weights|parity|loop|gen|block|update|refit|ties|ragged|attribution|forward|all)" >&2
             exit 2
             ;;
     esac
