@@ -26,22 +26,30 @@ if TYPE_CHECKING:
 class MegatronMegaMoEAdapter:
     """One FlashInfer mega layer per Megatron ``InferenceGroupedMLP``.
 
-    ``MoEEpMegaLayer`` transforms the canonical weight pack at construction and
-    releases the source tensors, so the expert weights are snapshotted on the
-    first forward. Refitting Megatron's expert parameters afterwards does not
-    reach the kernel; the adapter must be rebuilt instead.
+    In inference, ``MoEEpMegaLayer`` transforms the canonical weight pack at
+    construction and releases the source tensors, so the expert weights are
+    snapshotted on the first forward. Refitting Megatron's expert parameters
+    afterwards does not reach the kernel; the adapter must be rebuilt instead.
+
+    ``owns_transformed_weights`` inverts that for training, where the optimizer
+    rewrites the parameters every step. The caller then supplies weights that
+    are already in the kernel's layout and keeps rewriting them in place, and
+    FlashInfer's own preprocessing is bypassed so it cannot snapshot anything.
+    See :mod:`megatron.core.inference.moe.mega.training_weights`.
     """
 
     def __init__(
         self,
         config: "TransformerConfig",
         ep_group: torch.distributed.ProcessGroup,
+        owns_transformed_weights: bool = False,
     ) -> None:
         require_flashinfer_moe_ep()
         self._config = config
         self._ep_group = ep_group
         self._layer: Optional[MoEEpMegaLayer] = None
         self._warmed_up = False
+        self._owns_transformed_weights = owns_transformed_weights
 
     def _fleet_params(self) -> FleetParams:
         # dtype_bytes/algorithm/layout are split-transport fields the mega path
@@ -75,12 +83,24 @@ class MegatronMegaMoEAdapter:
                 "capture. Run one eager forward on all EP ranks before capturing."
             )
         megakernel = build_megakernel_config(self._config)
-        weights = megatron_grouped_weights_to_moe_pack(fc1_weight, fc2_weight)
         # quantize_input must stay True: the megakernels have no pre-quantized
         # activation path and reject quantize_input=False. The quantized
         # precisions derive activation scales in-kernel, so no calibration data
         # is needed here.
-        mega_config = MegaConfig(megakernel=megakernel, preprocess_weights=True)
+        if self._owns_transformed_weights:
+            # fc1/fc2 are already K-major kernel layout and the caller mutates
+            # them in place every step, so there is nothing to preprocess and
+            # nothing may be released. FlashInfer validates the layout here,
+            # which is what catches a repack that does not match its contract.
+            weights = None
+            mega_config = MegaConfig(
+                megakernel=megakernel,
+                preprocess_weights=False,
+                transformed_weights=((fc1_weight, None), (fc2_weight, None)),
+            )
+        else:
+            weights = megatron_grouped_weights_to_moe_pack(fc1_weight, fc2_weight)
+            mega_config = MegaConfig(megakernel=megakernel, preprocess_weights=True)
         self._layer = MoEEpMegaLayer(
             self._bootstrap(),
             self._fleet_params(),

@@ -1379,6 +1379,26 @@ class TransformerConfig(ModelParallelConfig):
     Sizes the symmetric-memory buffers, so a forward with more local tokens than this
     is rejected rather than falling back."""
 
+    moe_mega_training_forward: bool = False
+    """Run the training MoE forward through the FlashInfer mega kernel, keeping the
+    standard TE bf16 path for the backward.
+
+    Intended for train/generation parity in RL, not throughput: generation and the
+    training forward then execute the same kernel, so the importance ratio is not
+    polluted by kernel differences. It is not a speedup. The kernel's weights must
+    be rebuilt from the live parameters before every forward, and that repack costs
+    roughly as much as the fused forward saves.
+
+    Requires MoE-layer recompute. The mega forward saves no intermediates, so the
+    backward is built from the recompute pass, which runs the ordinary dispatch +
+    grouped-GEMM path. The gradient is therefore taken through the TE path while the
+    reported forward comes from the mega kernel; in bf16 the two differ only by
+    rounding, but they are not bitwise equal.
+
+    Restricted to inference_mega_precision='bf16': a quantized forward against a
+    bf16 backward is a straight-through estimator, which is a training-recipe
+    decision rather than a drop-in."""
+
     inference_moe_disable_fused_quant_kernels: bool = False
     """When False (default), use fused kernels that combine permute/activation with
     MXFP8 quantization + swizzle into a single kernel launch. Only applies when
@@ -1995,6 +2015,95 @@ class TransformerConfig(ModelParallelConfig):
                         "(moe_latent_size is set)."
                     )
 
+        if self.moe_mega_training_forward:
+            # Checked before the backend so a non-inference_optimized config gets
+            # the message that actually applies to it.
+            if self.transformer_impl != 'inference_optimized':
+                raise ValueError(
+                    "moe_mega_training_forward requires "
+                    "transformer_impl='inference_optimized', which is what builds the "
+                    f"mega-capable expert module; got '{self.transformer_impl}'."
+                )
+            # inference_grouped_gemm_backend is only converted from str to enum
+            # above when the inference-optimized branch runs, so accept either.
+            backend = self.inference_grouped_gemm_backend
+            if isinstance(backend, InferenceGroupedGemmBackend):
+                backend = backend.value
+            if backend != InferenceGroupedGemmBackend.FLASHINFER_MEGA.value:
+                raise ValueError(
+                    "moe_mega_training_forward requires "
+                    f"inference_grouped_gemm_backend='flashinfer_mega'; got '{backend}'."
+                )
+            if self.inference_mega_precision != 'bf16':
+                raise ValueError(
+                    "moe_mega_training_forward requires inference_mega_precision='bf16'. "
+                    f"'{self.inference_mega_precision}' would pair a quantized forward "
+                    "with a bf16 recomputed backward, i.e. a straight-through estimator."
+                )
+            # The mega forward saves no intermediates, so there is nothing to build a
+            # backward from unless the layer is recomputed.
+            if self.recompute_granularity != 'selective' or (
+                self.recompute_modules is not None and 'moe' not in self.recompute_modules
+            ):
+                raise ValueError(
+                    "moe_mega_training_forward requires recompute_granularity='selective' "
+                    "with 'moe' in recompute_modules: the mega forward stores no "
+                    "activations, so the backward must come from a recompute pass."
+                )
+            # MoELayer.moe_layer_recompute additionally excludes local CUDA graphs, so
+            # this combination would run the mega forward with no recompute behind it
+            # and leave the experts without a backward graph.
+            if self.cuda_graph_impl == 'local':
+                raise ValueError(
+                    "moe_mega_training_forward is incompatible with "
+                    "cuda_graph_impl='local', which disables MoE-layer recompute."
+                )
+            # The scratch buffer holding the kernel-layout weights is shared by every
+            # MoE layer and is only valid for the layer that most recently repacked it,
+            # so anything that overlaps or reorders MoE layer execution corrupts it.
+            if self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "moe_mega_training_forward is incompatible with "
+                    "overlap_moe_expert_parallel_comm: the shared kernel-weight scratch "
+                    "assumes one MoE layer executes at a time."
+                )
+            if self.delay_wgrad_compute:
+                raise ValueError(
+                    "moe_mega_training_forward does not support delay_wgrad_compute yet."
+                )
+            # Parity requires generation and the training value pass to route each
+            # token to the same experts. InferenceTopKRouter only takes its
+            # inference path while InferenceMode is active, so the value pass runs
+            # the training router. Both reach the same selection function with the
+            # same arguments, but the training router applies these first, and each
+            # of them changes which experts are picked. Rejected rather than
+            # tolerated because the loss of parity is otherwise silent.
+            balancing = self.moe_router_load_balancing_type
+            balancing = balancing if isinstance(balancing, list) else [balancing]
+            unsupported = {"sinkhorn", "quantile_balancing"}.intersection(balancing)
+            if unsupported:
+                raise ValueError(
+                    f"moe_mega_training_forward does not support "
+                    f"moe_router_load_balancing_type={sorted(unsupported)}: generation "
+                    "routes with plain top-k, so the training forward would select "
+                    "different experts."
+                )
+            if self.moe_input_jitter_eps is not None:
+                raise ValueError(
+                    "moe_mega_training_forward is incompatible with "
+                    "moe_input_jitter_eps: jitter perturbs the router input in "
+                    "training only, so the two forwards would route differently."
+                )
+            if self.moe_router_force_load_balancing or self.moe_router_force_biased is not None:
+                raise ValueError(
+                    "moe_mega_training_forward is incompatible with "
+                    "moe_router_force_load_balancing / moe_router_force_biased, which "
+                    "overwrite the training router's logits."
+                )
+            # moe_expert_capacity_factor would also break parity, but it needs no
+            # check here: this path requires transformer_impl='inference_optimized',
+            # which already rejects it as non-dropless above.
+
             if (
                 self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
                 and mxfp8_enabled
@@ -2028,14 +2137,24 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
             if self.batch_invariant_mode:
+                # flashinfer_mega composes with batch-invariant mode because the
+                # two cover disjoint parts of the layer: the megakernel replaces
+                # only the expert compute, which measures batch-invariant on its
+                # own, while batch-invariant mode covers attention, the qkv and
+                # output projections, the norms and the router. Its contribution
+                # under mega is the router -- it switches InferenceTopKRouter to
+                # the same eager topk_routing_with_score_function the training
+                # TopKRouter uses, and that fp32 difference is what otherwise
+                # shows up as a per-token log-prob mismatch.
                 if self.inference_grouped_gemm_backend not in (
                     InferenceGroupedGemmBackend.FLASHINFER,
                     InferenceGroupedGemmBackend.TORCH,
                     InferenceGroupedGemmBackend.VLLM,
+                    InferenceGroupedGemmBackend.FLASHINFER_MEGA,
                 ):
                     raise ValueError(
                         "batch_invariant_mode requires inference_grouped_gemm_backend "
-                        "'flashinfer', 'torch', or 'vllm'."
+                        "'flashinfer', 'flashinfer_mega', 'torch', or 'vllm'."
                     )
                 if (
                     self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
@@ -2046,8 +2165,14 @@ class TransformerConfig(ModelParallelConfig):
                         "backend only for an MXFP8 model configuration. Selectively BF16 "
                         "expert layers within that configuration remain supported."
                     )
+                # The nvls requirement is about the dispatcher's cross-rank
+                # combine. The megakernel never reaches it: it owns EP transport
+                # and forces the passthrough dispatcher, ignoring
+                # inference_moe_token_dispatcher_type entirely.
                 if (
-                    self.expert_model_parallel_size > 1
+                    self.inference_grouped_gemm_backend
+                    != InferenceGroupedGemmBackend.FLASHINFER_MEGA
+                    and self.expert_model_parallel_size > 1
                     and self.inference_moe_token_dispatcher_type != "nvls"
                 ):
                     raise ValueError(

@@ -1251,10 +1251,27 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
         self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
         self._mega_adapter = None
+        self._mega_training_adapter = None
+        self._mega_training_forward = config.moe_mega_training_forward
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER_MEGA:
             from megatron.core.inference.moe.mega import MegatronMegaMoEAdapter
 
             self._mega_adapter = MegatronMegaMoEAdapter(config=config, ep_group=self.ep_group)
+            if self._mega_training_forward:
+                # Separate adapter because the two callers hand FlashInfer weights
+                # in different forms and it binds that choice at construction:
+                # inference lets it preprocess and snapshot static weights, while
+                # training supplies an already-transformed buffer that is rewritten
+                # every step. Colocated RL drives both through this one module, so
+                # both adapters have to exist. Each builds its mega layer lazily, so
+                # a training-only or inference-only job pays for just one.
+                self._mega_training_adapter = MegatronMegaMoEAdapter(
+                    config=config, ep_group=self.ep_group, owns_transformed_weights=True
+                )
+        # Driven by MoELayer, which owns the distinction between the pass that
+        # produces the layer output and the recompute pass that builds the
+        # backward graph. See MoELayer._mega_pass_is_value.
+        self._in_mega_recompute = False
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -1543,6 +1560,68 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
         return output, None
 
+    def _mega_dense_routing_to_topk(self, routing_map, probs):
+        """Convert the training router's dense outputs to the kernel's topk form.
+
+        InferenceTopKRouter returns ``[tokens, topk]`` expert indices only while
+        InferenceMode is active; in training it defers to TopKRouter, which
+        returns a boolean ``[tokens, num_experts]`` map alongside dense probs.
+        The megakernel takes indices, so convert.
+
+        The selection is read from the map rather than from the top probabilities,
+        because expert_bias and group_topk choose experts on adjusted scores and
+        those need not be the largest entries of ``probs``. Ties in the boolean
+        map resolve to ascending expert id, which keeps the order deterministic.
+        """
+        if routing_map.dtype != torch.bool:
+            return routing_map, probs
+        topk = self.config.moe_router_topk
+        indices = routing_map.to(torch.uint8).topk(topk, dim=-1).indices
+        return indices, probs.gather(1, indices)
+
+    def _mega_training_forward_pass(self, hidden_states, probs, routing_map):
+        """Mega kernel forward during training, reading freshly repacked weights.
+
+        Unlike :meth:`_mega_forward`, the expert weights cannot be aliased onto a
+        persistent buffer: DDP owns parameter storage and refuses to adopt a
+        parameter whose data is already a view. The kernel layout is rebuilt from
+        the live parameters into a scratch buffer shared by all MoE layers, so it
+        must be consumed by this forward before another layer repacks it.
+        """
+        from megatron.core.inference.moe.mega.training_weights import (
+            MegaTrainingWeightScratch,
+            kernel_layout_from_parameters,
+        )
+
+        assert routing_map is not None, "routing_map is required for flashinfer_mega forward."
+        assert self._mega_training_adapter is not None
+        routing_map, probs = self._mega_dense_routing_to_topk(routing_map, probs)
+        experts = range(self.num_local_experts)
+        fc1_weights = [getattr(self.linear_fc1, f'weight{i}') for i in experts]
+        fc2_weights = [getattr(self.linear_fc2, f'weight{i}') for i in experts]
+        owner = id(self)
+        fc1_kernel, fc2_kernel = kernel_layout_from_parameters(
+            self.config, fc1_weights, fc2_weights, owner=owner
+        )
+        output = self._mega_training_adapter.forward(
+            hidden_states,
+            routing_map,
+            probs.to(torch.float32),
+            fc1_kernel,
+            fc2_kernel,
+        )
+        # The kernel reads the scratch on this stream inside the call above, so a
+        # different owner here means a second MoE layer ran in between and the
+        # weights just used were not this layer's.
+        MegaTrainingWeightScratch.get(
+            num_local_experts=self.num_local_experts,
+            hidden_size=self.config.hidden_size,
+            intermediate_size=self.config.moe_ffn_hidden_size,
+            dtype=fc1_weights[0].dtype,
+            device=fc1_weights[0].device,
+        ).assert_owned_by(owner)
+        return output, None
+
     def _vllm_forward(self, hidden_states, probs, routing_map):
         """vLLM Triton fused MoE kernel forward (BF16, CUDA-graph safe)."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
@@ -1591,6 +1670,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
             assert (
                 not self.config.fp8 or self.config.fp8_recipe != Fp8Recipe.mxfp8
             ), "MXFP8 inference optimized is not compatible with training / colocated RL."
+            # Train/generation parity mode: the value-producing forward runs the
+            # same kernel generation uses, while the recompute pass takes the TE
+            # path to build the backward graph.
+            if self._mega_training_forward and not self._in_mega_recompute:
+                return self._mega_training_forward_pass(
+                    permuted_local_hidden_states, permuted_probs, routing_map=routing_map
+                )
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
 
         # Lazily build concatenated weights on first forward (after checkpoint load)

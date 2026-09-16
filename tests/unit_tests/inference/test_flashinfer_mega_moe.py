@@ -43,7 +43,10 @@ def _config(**overrides):
         bf16=True,
         params_dtype=torch.bfloat16,
         transformer_impl="inference_optimized",
-        inference_grouped_gemm_backend=InferenceGroupedGemmBackend.FLASHINFER_MEGA,
+        # Must be the string, as argparse supplies it: __post_init__ converts to
+        # the enum only after the gated-linear-unit backend check, which compares
+        # against strings.
+        inference_grouped_gemm_backend="flashinfer_mega",
         inference_mega_max_tokens_per_rank=64,
         attention_backend=AttnBackend.local,
         use_cpu_initialization=True,
