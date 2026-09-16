@@ -15,6 +15,19 @@ cover:
 3. Forward and backward stay close to the standard TE bf16 path, so the
    gradient taken through the recompute pass is still the gradient of
    something close to what was computed.
+4. The MoE layer behaves the same inside a whole transformer layer as it does
+   alone. Everything else here builds the MoE layer by itself, so nothing sees
+   attention, the projections, or the norms around it -- and enabling the
+   megakernel on the training side also switches that surrounding layer to the
+   inference-optimized spec, which is a change the MoE-only tests cannot
+   observe. Generation is out of scope at this level: it needs a dynamic
+   inference context and a KV cache, which only the end-to-end run provides.
+5. Generation keeps serving the current weights. RL refits between rollouts and
+   the megakernel holds its own transformed copy of the expert weights, so a
+   refit that does not reach that copy means the next rollout samples from the
+   previous step's policy -- silently, since nothing reads the parameters again.
+   This is the one property here that is about generation alone, and it is
+   covered in this file because it shares the harness.
 
 Needs Blackwell for the sm100 megakernels, plus the FlashInfer main-branch
 overlay that carries moe_ep. ``scripts/local/run_mega_training_tests.sh`` sets
@@ -180,6 +193,39 @@ def _copy_expert_weights(src, dst):
     buffer on first use.
     """
     dst.load_state_dict(src.state_dict())
+
+
+def _bump_expert_weights(layer, delta=0.01):
+    """Rewrite the expert parameters in place, standing in for an optimizer or a refit.
+
+    In place on purpose. Once generation has run, the parameters are views into
+    the concatenated stack that the kernel weights are packed from, so this is
+    the same write a refit performs and it reaches the buffer the repack reads.
+    """
+    with torch.no_grad():
+        for name, param in layer.named_parameters():
+            if "expert" in name or "linear_fc" in name:
+                param.add_(delta)
+
+
+def _use_flashinfer_preprocessing(layer):
+    """Put one generation layer back on FlashInfer's own weight preprocessing.
+
+    bf16 generation owns its transformed weights so that a refit can rewrite
+    them, which leaves no in-tree way to reach the path FlashInfer takes when it
+    preprocesses and snapshots the weights itself. Rebuilding the adapter is
+    enough to get it back: each one builds its FlashInfer layer lazily, so this
+    is still a layer that has never been handed a weight.
+    """
+    from megatron.core.inference.moe.mega import MegatronMegaMoEAdapter
+
+    experts = layer.experts
+    experts._mega_adapter = MegatronMegaMoEAdapter(
+        config=experts.config, ep_group=experts.ep_group, owns_transformed_weights=False
+    )
+    # Instance attribute shadowing the method, so the adapter is handed the raw
+    # per-expert stacks and preprocesses them the way it did before the buffer.
+    experts._mega_inference_weights = lambda: None
 
 
 def _hidden(config, seed, tokens=None):
@@ -444,6 +490,50 @@ class TestTrainGenParity:
         assert warm < 1e-6, f"train/gen parity broken when warm: rel_rms={warm:.3e}"
         assert cold < self.COLD_TOL, f"cold train/gen parity: rel_rms={cold:.3e}"
 
+    def test_eval_mode_forward_matches_generation_forward(self):
+        """The log-prob pass runs under eval(), and it is the pass RL compares.
+
+        Distinct from the test above, which exercises train(). RL takes
+        log-probs with model.eval() and no grad, so a mega forward conditioned
+        on training mode would send the one forward whose numbers must match
+        generation down the TE path instead, ~6e-3 away, while every test here
+        that calls .train() kept passing.
+        """
+        config = _config(mega_training=True)
+        gen_layer = _build_layer(_config(mega_training=False), for_inference=True).eval()
+        # eval(), exactly as the log-prob pass leaves it. No recompute pairs
+        # with this forward and none is needed: without grad there is no
+        # backward to rebuild.
+        eval_layer = _build_layer(config).eval()
+        _copy_expert_weights(gen_layer, eval_layer)
+
+        hidden = _hidden(config, seed=1)
+
+        errors = []
+        for _ in range(PARITY_REPEATS):
+            with torch.no_grad():
+                with InferenceMode.active():
+                    gen_out, _ = gen_layer(hidden)
+                eval_out, _ = eval_layer(hidden)
+            errors.append(_rel_rms(eval_out, gen_out))
+
+        stats = torch.tensor(
+            [errors[0], max(errors[1:], default=0.0)], device="cuda"
+        )
+        torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.MAX)
+        cold, warm = stats[0].item(), stats[1].item()
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[mega-metric] eval/gen parity: cold={cold:.3e} worst_warm={warm:.3e}",
+                flush=True,
+            )
+
+        assert warm < 1e-6, (
+            f"eval-mode (log-prob) forward does not match generation: rel_rms={warm:.3e}. "
+            "A value near 6e-3 means the eval forward fell back to TE."
+        )
+        assert cold < self.COLD_TOL, f"cold eval/gen parity: rel_rms={cold:.3e}"
+
     def test_parity_holds_across_token_counts(self):
         """The parity RL actually needs: same weights, different token counts.
 
@@ -678,11 +768,8 @@ class TestTrainGenParity:
         train_layer(hidden)
 
         # Stand in for an optimizer step, applied to both layers.
-        with torch.no_grad():
-            for layer in (gen_layer, train_layer):
-                for name, param in layer.named_parameters():
-                    if "expert" in name or "linear_fc" in name:
-                        param.add_(0.01)
+        for layer in (gen_layer, train_layer):
+            _bump_expert_weights(layer)
 
         with torch.no_grad(), InferenceMode.active():
             gen_out, _ = gen_layer(hidden)
@@ -690,6 +777,195 @@ class TestTrainGenParity:
 
         error = _measure(train_out, gen_out, "train/gen parity after update")
         assert error < 1e-6, f"parity lost after weight update: rel_rms={error:.3e}"
+
+
+class TestGenerationWeightOwnership:
+    """(4) Generation serves the weights it was last refit with.
+
+    The megakernel holds its own transformed copy of the expert weights and
+    reads that copy, not the parameters. There are two ways to keep it current:
+    let FlashInfer preprocess the parameters and snapshot the result, which is
+    right exactly once, or own the buffer and rewrite it in place. bf16 does the
+    latter so that an RL refit is a repack rather than a teardown -- tearing a
+    mega layer down and rebuilding it costs an EP collective, a symmetric-heap
+    reallocation and a CuTeDSL recompile per refit.
+
+    These cover what that buys and what it risks: that the repack reproduces
+    what FlashInfer would have produced, that a refit actually reaches the
+    kernel, and that one layer's repack cannot be served to another.
+    """
+
+    def test_caller_owned_weights_match_flashinfer_preprocessing(self):
+        """The repack is equivalent to the path it replaced, end to end.
+
+        ``test_mega_training_weights.py`` already pins the packed bytes against
+        FlashInfer's own ``_interleave_gate_up_32``. This is the other half:
+        that handing those bytes over as ``transformed_weights`` with
+        ``preprocess_weights=False`` produces the same forward as letting
+        FlashInfer build the pack itself, so the adapter wiring is right and not
+        just the layout.
+        """
+        config = _config(mega_training=False)
+        owned = _build_layer(config, for_inference=True).eval()
+        preprocessed = _build_layer(config, for_inference=True).eval()
+        _copy_expert_weights(owned, preprocessed)
+        _use_flashinfer_preprocessing(preprocessed)
+
+        hidden = _hidden(config, seed=6)
+        with torch.no_grad(), InferenceMode.active():
+            owned_out, _ = owned(hidden)
+            preprocessed_out, _ = preprocessed(hidden)
+
+        error = _measure(owned_out, preprocessed_out, "caller-owned vs preprocessed weights")
+        assert error < 1e-6, (
+            f"the caller-owned repack does not reproduce FlashInfer's own weight "
+            f"preprocessing: rel_rms={error:.3e}"
+        )
+
+    def test_refit_without_a_refresh_serves_stale_weights(self):
+        """Negative control: the staleness the refit hook exists to prevent is real.
+
+        Writing the parameters is not enough on its own, which is the whole
+        reason ``resharding.refit`` has to call the hook. Worth asserting rather
+        than assuming, because the failure it guards against is silent -- the
+        rollouts stay finite and plausible, they just come from the previous
+        step's policy, and the importance ratio that is supposed to catch train/
+        gen mismatch is computed against those same stale log-probs.
+        """
+        config = _config(mega_training=False)
+        layer = _build_layer(config, for_inference=True).eval()
+        hidden = _hidden(config, seed=6)
+
+        with torch.no_grad(), InferenceMode.active():
+            before, _ = layer(hidden)
+            # Cloned because FlashInfer may hand back a workspace tensor it
+            # overwrites on the next call, which would make the comparison
+            # below pass by aliasing rather than by staleness.
+            before = before.clone()
+
+        _bump_expert_weights(layer)
+        with torch.no_grad(), InferenceMode.active():
+            stale, _ = layer(hidden)
+        assert torch.equal(before, stale), (
+            "the kernel picked up a parameter write with no refresh, so the "
+            "buffer is not actually owned and cached; this test no longer "
+            "controls for anything"
+        )
+
+        assert layer.experts.refresh_mega_weights() is True
+        with torch.no_grad(), InferenceMode.active():
+            refreshed, _ = layer(hidden)
+        assert not torch.equal(before, refreshed), (
+            "refresh_mega_weights() did not reach the kernel: generation still "
+            "returns the pre-refit output"
+        )
+
+    def test_refresh_after_a_refit_matches_a_freshly_built_layer(self):
+        """The refreshed weights are right, not merely different.
+
+        A refit is only correct if the refitted layer becomes
+        indistinguishable from a layer that had the new weights all along, which
+        is the reference here. Bitwise, since both sides pack the same bytes and
+        run the same kernel.
+        """
+        config = _config(mega_training=False)
+        refitted = _build_layer(config, for_inference=True).eval()
+        hidden = _hidden(config, seed=6)
+
+        # The first forward is what binds the kernel to the pre-refit weights;
+        # without it there would be nothing stale to refresh.
+        with torch.no_grad(), InferenceMode.active():
+            refitted(hidden)
+        _bump_expert_weights(refitted)
+        assert refitted.experts.refresh_mega_weights() is True
+
+        reference = _build_layer(config, for_inference=True).eval()
+        _copy_expert_weights(refitted, reference)
+
+        with torch.no_grad(), InferenceMode.active():
+            refitted_out, _ = refitted(hidden)
+            reference_out, _ = reference(hidden)
+
+        error = _measure(refitted_out, reference_out, "gen weights after refit")
+        assert error < 1e-6, (
+            f"a refreshed layer and a freshly built one disagree: rel_rms={error:.3e}; "
+            "the repack ran but did not reproduce the refit weights"
+        )
+
+    def test_refit_discovers_the_refresh_hook(self):
+        """``resharding.refit`` finds the hook by name, so keep it findable.
+
+        The refit walks ``tgt_core.modules()`` and calls whatever answers to
+        ``refresh_mega_weights``. Nothing type-checks that, so renaming the
+        method or moving it off the experts module would disable refit silently
+        and leave generation on snapshotted weights.
+        """
+        config = _config(mega_training=False)
+        layer = _build_layer(config)
+
+        hooks = [
+            module
+            for module in layer.modules()
+            if getattr(module, "refresh_mega_weights", None) is not None
+        ]
+        assert hooks == [layer.experts], (
+            "refresh_mega_weights is not reachable from the module tree the way "
+            f"resharding.refit looks it up; found {hooks}"
+        )
+        assert hooks[0].refresh_mega_weights() is True
+
+    def test_each_generation_layer_owns_its_weight_buffer(self):
+        """Generation buffers are per layer, unlike the training scratch.
+
+        The training forward shares one buffer across the whole model because it
+        repacks inside every layer's forward. Generation cannot: it packs once
+        and reuses, so a shared buffer would mean every layer but the last
+        computed with whichever layer packed most recently -- and a real model
+        has dozens of MoE layers, while every other test here has one.
+        """
+        config = _config(mega_training=False)
+        first = _build_layer(config, for_inference=True).eval()
+        second = _build_layer(config, for_inference=True).eval()
+        # Deliberately not synced: identical experts would make a shared buffer
+        # undetectable. Successive builds draw different weights from the RNG,
+        # which the first assertion below confirms.
+        hidden = _hidden(config, seed=6)
+
+        with torch.no_grad(), InferenceMode.active():
+            first_before, _ = first(hidden)
+            first_before = first_before.clone()
+            second_out, _ = second(hidden)
+            second_out = second_out.clone()
+            first_after, _ = first(hidden)
+
+        assert not torch.equal(first_before, second_out), (
+            "the two layers hold the same expert weights, so this cannot detect "
+            "a shared buffer"
+        )
+        assert torch.equal(first_before, first_after), (
+            "one generation layer's output changed after another layer ran, so "
+            "they are sharing a weight buffer"
+        )
+
+    def test_refresh_refuses_a_quantized_precision(self):
+        """The quantized precisions cannot be refit, and say so rather than drifting.
+
+        FlashInfer quantizes while it preprocesses; the repack only reshapes, so
+        there is no way to rebuild an mxfp8 or nvfp4 kernel weight from the bf16
+        parameters. Refusing is the point -- the alternative is generation
+        quietly continuing on the weights snapshotted before the refit. See
+        ``megatron/core/inference/moe/mega/QUANTIZED_BLOCKERS.md``.
+        """
+        config = _config(mega_training=False)
+        layer = _build_layer(config)
+        # The precision is read at refresh time rather than captured at
+        # construction, so flipping it here reaches the guard without needing
+        # quantized parameters -- which is convenient, since this refusal is
+        # itself why no quantized RL path exists to build them.
+        layer.experts.config.inference_mega_precision = "mxfp8"
+
+        with pytest.raises(NotImplementedError, match="quantizes the weights"):
+            layer.experts.refresh_mega_weights()
 
 
 class TestAgainstStandardBf16:
@@ -755,3 +1031,131 @@ class TestAgainstStandardBf16:
             "mega vs TE bf16 wgrad",
         )
         assert wgrad_error < self.GRAD_TOL, f"wgrad diverges: rel_rms={wgrad_error:.3e}"
+
+
+class TestWholeTransformerLayer:
+    """(4) The MoE layer inside the transformer layer it actually ships in.
+
+    Turning on moe_mega_training_forward also forces the training side onto
+    transformer_impl='inference_optimized', so attention, the projections and
+    the norms all change implementation along with the experts. The MoE-only
+    tests above cannot see any of that, and a first RL run found its failures
+    in exactly that surrounding code.
+
+    Generation is deliberately absent: it needs a dynamic inference context and
+    a KV cache to compare against, which is the end-to-end run's job.
+    """
+
+    # Looser than the MoE-only comparison because a whole layer puts attention,
+    # two norms and the projections in front of the expert output, so the same
+    # kernel difference arrives having been through more arithmetic.
+    BLOCK_TOL = 2e-2
+    SEQ_LEN = 16
+    BATCH = 2
+
+    def _config(self, mega_training: bool):
+        # SEQ_LEN * BATCH tokens per rank has to stay under the workspace cap
+        # that _config sets, and hidden_dropout is off so train and eval differ
+        # only in which kernel runs, not in sampled noise.
+        return _config(mega_training, hidden_dropout=0.0)
+
+    def _build_block(self, config):
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_layer_with_inference_submodules,
+        )
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        submodules = get_gpt_layer_with_inference_submodules(
+            num_experts=config.num_moe_experts, moe_grouped_gemm=True
+        )
+        return TransformerLayer(config, submodules).cuda()
+
+    def _inputs(self, config, seed):
+        hidden = torch.randn(
+            (self.SEQ_LEN, self.BATCH, config.hidden_size),
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=torch.Generator(device="cuda").manual_seed(seed),
+        )
+        mask = torch.ones((1, 1, self.SEQ_LEN, self.SEQ_LEN), dtype=bool, device="cuda")
+        return hidden, mask
+
+    @staticmethod
+    def _count_mega_calls(block):
+        """Count entries into the megakernel.
+
+        Without this a fallback to TE would leave every assertion here still
+        passing, since the two paths agree to within the tolerances being
+        checked -- the test would go green while measuring nothing.
+        """
+        experts = block.mlp.experts
+        calls = []
+        original = experts._mega_training_forward_pass
+
+        def counting(*args, **kwargs):
+            calls.append(1)
+            return original(*args, **kwargs)
+
+        experts._mega_training_forward_pass = counting
+        return calls
+
+    def test_layer_forward_backward_runs(self):
+        config = self._config(mega_training=True)
+        block = self._build_block(config).train()
+        calls = self._count_mega_calls(block)
+
+        hidden, mask = self._inputs(config, seed=11)
+        hidden.requires_grad_(True)
+        out, _ = block(hidden_states=hidden, attention_mask=mask)
+        out.sum().backward()
+
+        assert out.shape == (self.SEQ_LEN, self.BATCH, config.hidden_size)
+        assert torch.isfinite(out).all(), "non-finite activations out of the layer"
+        assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+        assert len(calls) == 1, (
+            f"expected exactly one megakernel call in the value pass, got {len(calls)}. "
+            "0 means the layer fell back to TE; >1 means the recompute pass took "
+            "the mega path too, which would leave the backward without a graph."
+        )
+
+    def test_eval_forward_matches_train_forward(self):
+        """Log-prob shape of the pass, inside the full layer.
+
+        With dropout off the two modes should produce the same value, and both
+        should reach the kernel. Before the eval-mode fix this failed with a
+        difference around the TE-vs-mega gap rather than zero.
+        """
+        config = self._config(mega_training=True)
+        block = self._build_block(config)
+        hidden, mask = self._inputs(config, seed=12)
+
+        block.train()
+        with torch.no_grad():
+            train_out, _ = block(hidden_states=hidden, attention_mask=mask)
+
+        block.eval()
+        eval_calls = self._count_mega_calls(block)
+        with torch.no_grad():
+            eval_out, _ = block(hidden_states=hidden, attention_mask=mask)
+
+        assert len(eval_calls) == 1, (
+            f"eval-mode forward made {len(eval_calls)} megakernel calls, expected 1. "
+            "0 means the log-prob pass fell back to TE."
+        )
+        error = _measure(eval_out, train_out, "whole layer: eval vs train forward")
+        assert error < 1e-6, f"eval and train forwards disagree: rel_rms={error:.3e}"
+
+    def test_layer_forward_matches_te_layer(self):
+        config = self._config(mega_training=True)
+        te_block = self._build_block(self._config(mega_training=False)).train()
+        mega_block = self._build_block(config).train()
+        # Whole-layer copy, not just the experts: attention and the norms have
+        # to match too or the comparison measures initialization, not kernels.
+        mega_block.load_state_dict(te_block.state_dict())
+
+        hidden, mask = self._inputs(config, seed=13)
+        te_out, _ = te_block(hidden_states=hidden, attention_mask=mask)
+        mega_out, _ = mega_block(hidden_states=hidden, attention_mask=mask)
+
+        error = _measure(mega_out, te_out, "whole layer: mega vs TE")
+        assert error < self.BLOCK_TOL, f"layer output diverges from TE: rel_rms={error:.3e}"
