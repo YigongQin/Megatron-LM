@@ -9,13 +9,16 @@
 # container's flashinfer wheel.
 #
 #   ./scripts/local/run_mega_training_tests.sh      # the acceptance plan, ~3 min
+#   PHASES=gen ./scripts/local/run_mega_training_tests.sh   # generation only
+#   FI_OVERLAY=0 PHASES=gen ./scripts/local/...  # against the venv's flashinfer
 #   PHASES=parity ./scripts/local/run_mega_training_tests.sh
+#   PHASES=block ./scripts/local/run_mega_training_tests.sh  # whole transformer layer
 #   PARITY_RUNS=10 ./scripts/local/run_mega_training_tests.sh
 #   PHASES=all ./scripts/local/run_mega_training_tests.sh   # + attribution
 #   BI=0 PHASES=parity ./scripts/local/run_mega_training_tests.sh
 #   PYTEST_ARGS="-k something" PHASES=forward ./scripts/local/...
 #
-# The bare invocation runs three phases, in order:
+# The bare invocation runs four phases, in order:
 #   weights - layout repack and config validation. CPU-only and single rank, so
 #             it passes without Blackwell or the overlay. Seconds.
 #   parity  - train/gen forward parity, cold and warm, at one token count and
@@ -28,6 +31,11 @@
 #             comparison against the standard TE bf16 path. One launch is
 #             enough because these assert a tolerance, not bitwise agreement,
 #             and bf16 rounding does not vary by launch.
+#   gen     - the generation side alone: that the caller-owned weight buffer
+#             reproduces FlashInfer's own preprocessing, and that a refit
+#             reaches the kernel. Run this before an RL bring-up; a refit that
+#             misses the kernel yields plausible rollouts from the previous
+#             step's policy rather than an error.
 #
 # Deliberately not in the default plan is the attribution phase, four tests
 # written to localize the parity residual by holding one variable at a time
@@ -44,12 +52,28 @@ set -u
 
 BASE=/lustre/fsw/portfolios/coreai/users/yigongq/post-training
 VENV=$BASE/RL/venvs/infopt-mcore/nemo_rl.models.policy.workers.megatron_policy_worker.MegatronPolicyWorker
-REPO=$BASE/Megatron-LM
+# The tree this script lives in, rather than a fixed path. Megatron-LM is
+# developed in place under RL/3rdparty, which is where the editable
+# megatron-core install resolves to and therefore the only copy an RL run
+# imports; testing the standalone worktree instead would measure bytes no run
+# will execute. Override REPO to test a different checkout.
+REPO=${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}
 LOGDIR=$REPO/logs
 
-# This worktree must precede the container's editable Megatron install, and
-# fi-main-overlay supplies moe_ep mega kernels absent from flashinfer 0.6.8.
-export PYTHONPATH=$REPO:$BASE/fi-main-overlay
+# This tree must precede the container's editable Megatron install. The overlay
+# then supplies the moe_ep mega kernels, which are absent from the flashinfer
+# 0.6.8 wheel the worker venv was originally built against.
+#
+# Note it shadows the venv's own flashinfer, being earlier on PYTHONPATH. Once
+# the venv is rebuilt against the 0.7.0 git pin in RL's pyproject.toml, moe_ep
+# is in the venv and FI_OVERLAY=0 is the more honest test: it imports the same
+# flashinfer an RL run will.
+FI_OVERLAY=${FI_OVERLAY:-1}
+if [ "$FI_OVERLAY" = "1" ]; then
+    export PYTHONPATH=$REPO:$BASE/fi-main-overlay
+else
+    export PYTHONPATH=$REPO
+fi
 # Pointing at our own cubin dir sidesteps the flashinfer/flashinfer-cubin
 # version check; the mega kernels are CuTeDSL-compiled and use no prebuilt
 # cubins, so an empty directory is fine.
@@ -77,10 +101,10 @@ EP=${EP:-$GPUS}
 # A desynchronized EP collective otherwise burns the full 600 s NCCL watchdog
 # timeout before anything is reported.
 TIMEOUT=${TIMEOUT:-420}
-PHASES=${PHASES:-"weights parity loop"}
+PHASES=${PHASES:-"weights parity loop gen block"}
 # The plan plus the diagnostics, which together are every test in both files.
 if [ "$PHASES" = "all" ]; then
-    PHASES="weights parity loop attribution"
+    PHASES="weights parity loop gen block attribution"
 fi
 # Three launches keeps the default under the time budget while still being
 # informative: the residual ran ~6/10 launches before batch-invariant mode, so
@@ -119,7 +143,19 @@ if [ $((GPUS % EP)) -ne 0 ]; then
 fi
 
 if [ ! -x "$PY" ]; then
-    echo "$PY is not executable. This script must run inside the NeMo RL container." >&2
+    # Two different failures, and -x cannot tell them apart: the venv's
+    # interpreter is a symlink into /root/.local/share/uv (mode 700), because
+    # the container builds the venv as root. A non-root shell sees the symlink
+    # but cannot stat its target, which -x reports the same as absent.
+    if [ -e "$PY" ] || [ -L "$PY" ]; then
+        echo "$PY is not executable as $(id -un)." >&2
+        echo "  It points at $(readlink "$PY" 2>/dev/null)," >&2
+        echo "  which is unreadable unless you are the user that built the venv (root)." >&2
+        echo "  Re-run as root inside the container, or rebuild the venv with" >&2
+        echo "  UV_PYTHON_INSTALL_DIR set outside /root." >&2
+    else
+        echo "$PY not found. This script must run inside the NeMo RL container." >&2
+    fi
     exit 2
 fi
 
@@ -174,6 +210,26 @@ for phase in $PHASES; do
             selector="-k 'ep_and_dp or replicas_agree or te_bf16'"
             launches=1
             ;;
+        # The generation side on its own: the caller-owned weight buffer and the
+        # refit hook. Worth running alone before an RL bring-up, since a refit
+        # that does not reach the kernel produces plausible rollouts from the
+        # previous step's policy rather than an error.
+        gen)
+            ranks=$GPUS
+            target=$FORWARD
+            selector="-k 'TestGenerationWeightOwnership'"
+            launches=1
+            ;;
+        # The MoE layer inside a whole transformer layer, so attention and the
+        # projections are in the picture. Enabling mega on the training side
+        # also moves that surrounding code onto the inference-optimized spec,
+        # which every other phase here builds around rather than through.
+        block)
+            ranks=$GPUS
+            target=$FORWARD
+            selector="-k 'TestWholeTransformerLayer'"
+            launches=1
+            ;;
         attribution)
             ranks=$GPUS
             target=$FORWARD
@@ -188,7 +244,7 @@ for phase in $PHASES; do
             launches=1
             ;;
         *)
-            echo "unknown phase=$phase (weights|parity|loop|attribution|forward|all)" >&2
+            echo "unknown phase=$phase (weights|parity|loop|gen|block|attribution|forward|all)" >&2
             exit 2
             ;;
     esac

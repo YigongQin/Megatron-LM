@@ -709,7 +709,7 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
-            if self.mega_training_forward and self.training:
+            if self._mega_forward_applies():
                 # The mega kernel consumes undispatched local tokens and does its
                 # own EP transport, so the value pass bypasses dispatch/combine
                 # while the recompute pass needs the real ones to build wgrad.
@@ -770,7 +770,7 @@ class MoELayer(BaseMoELayer):
         # Mark the next custom_forward invocation as the output-producing pass.
         # custom_forward clears this, so the recompute triggered from backward
         # takes the TE path.
-        self._mega_pass_is_value = self.mega_training_forward and self.training
+        self._mega_pass_is_value = self._mega_forward_applies()
 
         if self.moe_layer_recompute and self.training:
             if self.config.fp8 or self.config.fp4:
@@ -791,6 +791,24 @@ class MoELayer(BaseMoELayer):
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
 
         return outputs
+
+    def _mega_forward_applies(self) -> bool:
+        """Whether this module's forward should route expert compute through mega.
+
+        Deliberately not conditioned on ``self.training``. The pass that has to
+        match generation is the log-prob forward, and RL frameworks run that
+        under ``model.eval()`` -- gating on training mode would quietly send
+        exactly that pass down the TE path and leave it the ~6e-3 away from
+        generation that this mode exists to close.
+
+        Eval needs no recompute to pair with: without grad there is no backward
+        to rebuild, so the single ``custom_forward`` call is the value pass.
+
+        ``InferenceMode`` is excluded because the inference engine reaches the
+        kernel through the inference dispatcher and the experts' own inference
+        adapter, which owns its weights separately from the training scratch.
+        """
+        return self.mega_training_forward and not InferenceMode.is_active()
 
     def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):
         """Compute weight gradients for experts and shared experts."""
