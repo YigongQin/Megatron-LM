@@ -1697,7 +1697,7 @@ class TestRaggedExpertOccupancy:
     """
 
     EXPERTS = int(os.environ.get("MEGA_TEST_PROD_EXPERTS", "128"))
-    TOKENS = int(os.environ.get("MEGA_TEST_RAGGED_TOKENS", "256"))
+    TOKENS = int(os.environ.get("MEGA_TEST_RAGGED_TOKENS", "1024"))
     # The rollout's decode width. Comparing against this is what makes the
     # occupancy on the two sides differ rather than merely be ragged.
     CHUNK = int(os.environ.get("MEGA_TEST_RAGGED_CHUNK", "8"))
@@ -1737,7 +1737,29 @@ class TestRaggedExpertOccupancy:
             wide = torch.bincount(
                 train_indices.reshape(-1).long(), minlength=self.EXPERTS
             )
+            # Order, not just membership. _routing_disagreements sorts before
+            # comparing, on the assumption that the combine is invariant to the
+            # order the experts are listed in -- an assumption checked at 16
+            # experts and never since. The two paths build the list
+            # differently: generation takes InferenceTopKRouter's top-k, while
+            # training recovers it from TopKRouter's dense mask via
+            # _mega_dense_routing_to_topk.
+            train_order = train_indices[differing].reshape(differing.numel(), -1)
+            gen_order = gen_indices[differing].reshape(differing.numel(), -1)
+            permuted = int((train_order != gen_order).any(dim=-1).sum().item())
+            print(
+                f"[mega-metric]   of {differing.numel()} disagreeing tokens, "
+                f"{permuted} have the same experts in a different order",
+                flush=True,
+            )
+
             for token in differing[:3].tolist():
+                print(
+                    f"[mega-metric]   token {token} order: "
+                    f"train={train_indices[token].reshape(-1).long().tolist()} "
+                    f"gen={gen_indices[token].reshape(-1).long().tolist()}",
+                    flush=True,
+                )
                 experts = sorted(set(train_indices[token].reshape(-1).long().tolist()))
                 chunk = gen_chunks[token // self.CHUNK]
                 decode = torch.bincount(chunk.reshape(-1).long(), minlength=self.EXPERTS)
@@ -1764,6 +1786,8 @@ class TestRaggedExpertOccupancy:
 
         worst = 0.0
         differed_total = 0
+        adapter_worst = 0.0
+        adapter_differed = 0
         for index, skew in enumerate(self.SKEWS):
             _skew_router(train, strength=skew, seed=400 + index)
             _copy_expert_weights(train, gen)
@@ -1803,6 +1827,19 @@ class TestRaggedExpertOccupancy:
             finally:
                 gen_adapter.forward = gen_saved
 
+            # Same width, different module: isolates the adapter instance
+            # from the launch width. TestKernelBatchInvarianceByPrecision
+            # shows one generation adapter is width-invariant even at this
+            # occupancy, so if this arm differs, two adapters is the variable
+            # and the kernel's arithmetic is not at fault.
+            with torch.no_grad(), InferenceMode.active():
+                gen_wide, _ = gen(hidden)
+            same_error, same_differed = _measure_token_count_parity(
+                scored, gen_wide, f"train vs gen at equal width (skew={skew})"
+            )
+            adapter_differed += same_differed
+            adapter_worst = max(adapter_worst, same_error)
+
             error, differed = _measure_token_count_parity(
                 scored, replayed, f"scoring vs decode-width replay (skew={skew})"
             )
@@ -1829,10 +1866,173 @@ class TestRaggedExpertOccupancy:
                     flush=True,
                 )
 
+        if torch.distributed.get_rank() == 0:
+            print(
+                f"[mega-metric] factored: equal-width train-vs-gen "
+                f"{adapter_differed} tokens (rel_rms={adapter_worst:.3e}) | "
+                f"wide-vs-decode {differed_total} tokens (rel_rms={worst:.3e}). "
+                f"The first column varies only the adapter instance; the second "
+                f"also varies launch width.",
+                flush=True,
+            )
+
         assert differed_total == 0 and worst < 1e-6, (
             f"{differed_total} tokens differ between one wide scoring launch and the same "
             f"tokens at decode width (rel_rms={worst:.3e}) once expert occupancy is ragged. "
             "This is the e2e comparison in miniature: the rollout computes a token at decode "
             "occupancy and the log-prob pass recomputes it at scoring occupancy, and a token "
             "that disagrees there is one the KL will show."
+        )
+
+
+_MEGA_PRECISIONS = tuple(
+    p for p in os.environ.get("MEGA_TEST_PRECISIONS", "bf16,mxfp8").split(",") if p
+)
+
+
+class TestKernelBatchInvarianceByPrecision:
+    """(10) Is the occupancy sensitivity a bf16 problem or a kernel problem?
+
+    ``TestRaggedExpertOccupancy`` showed the bf16 megakernel returning
+    different bits for the same token, same expert set, when the number of
+    tokens sharing those experts changes. That decides whether bf16 can carry
+    zero-KL RL; it does not say anything about the quantized precisions, which
+    are separate kernels with their own tiling.
+
+    Generation against generation, deliberately. The training forward is
+    restricted to bf16 (``moe_mega_training_forward`` rejects everything else,
+    since a quantized forward cannot be rebuilt from the parameters after a
+    refit), so a train-versus-generation comparison cannot be written for
+    mxfp8 at all. Batch invariance does not need one: running the same tokens
+    wide and then at decode width exercises the same property, and for bf16 the
+    train and generation paths are already known to agree bitwise at equal
+    width.
+
+    Only the router is perturbed, never the experts, so the weights FlashInfer
+    snapshots and quantizes at build time stay valid across skews.
+    """
+
+    EXPERTS = int(os.environ.get("MEGA_TEST_PROD_EXPERTS", "128"))
+    TOKENS = int(os.environ.get("MEGA_TEST_RAGGED_TOKENS", "1024"))
+    CHUNK = int(os.environ.get("MEGA_TEST_RAGGED_CHUNK", "8"))
+    SKEWS = tuple(
+        float(x) for x in os.environ.get("MEGA_TEST_RAGGED_SKEWS", "0,2,6").split(",")
+    )
+
+    @pytest.mark.parametrize("precision", _MEGA_PRECISIONS)
+    def test_generation_is_invariant_to_expert_occupancy(self, precision):
+        if self.EXPERTS % EP_SIZE:
+            pytest.skip(f"{self.EXPERTS} experts do not divide EP={EP_SIZE}")
+
+        overrides = dict(
+            num_moe_experts=self.EXPERTS,
+            inference_mega_max_tokens_per_rank=self.TOKENS,
+            inference_mega_precision=precision,
+        )
+        if precision != "bf16":
+            # Megatron's fused quantize kernels cover squared-relu only; this
+            # spec is SwiGLU, and the mega path quantizes inside FlashInfer
+            # regardless.
+            overrides["inference_moe_disable_fused_quant_kernels"] = True
+
+        try:
+            gen = _build_layer(_config(mega_training=False, **overrides), for_inference=True)
+        except (ValueError, NotImplementedError, ImportError) as error:
+            pytest.skip(f"{precision} unavailable in this build: {error}")
+
+        worst = 0.0
+        differed_total = 0
+        for index, skew in enumerate(self.SKEWS):
+            _skew_router(gen, strength=skew, seed=700 + index)
+            hidden = _hidden(gen.config, seed=800 + index, tokens=self.TOKENS)
+
+            with torch.no_grad(), InferenceMode.active():
+                wide, _ = gen(hidden)
+            replayed = _chunked_generation(gen, hidden, chunk=self.CHUNK)
+
+            error, differed = _measure_token_count_parity(
+                wide, replayed, f"{precision}: wide vs decode-width (skew={skew})"
+            )
+            worst = max(worst, error)
+            differed_total += differed
+
+        if torch.distributed.get_rank() == 0:
+            verdict = "NOT batch invariant" if differed_total else "batch invariant"
+            print(
+                f"[mega-metric] {precision} over {len(self.SKEWS)} skews: "
+                f"{differed_total}/{len(self.SKEWS) * self.TOKENS} tokens differ "
+                f"-> {verdict}",
+                flush=True,
+            )
+
+        assert differed_total == 0 and worst < 1e-6, (
+            f"the {precision} megakernel is not invariant to expert occupancy: "
+            f"{differed_total} of {len(self.SKEWS) * self.TOKENS} tokens differ "
+            f"(rel_rms={worst:.3e}) between one wide launch and the same tokens at "
+            f"decode width. Zero-KL RL needs the rollout and the log-prob pass to "
+            f"agree bitwise, and they run at different widths by construction."
+        )
+
+    @pytest.mark.parametrize("precision", _MEGA_PRECISIONS)
+    def test_two_instances_agree_under_ragged_occupancy(self, precision):
+        """Two separately built layers, identical weights, one width.
+
+        This is the variable the factored ragged run isolated: with launch
+        width held equal, the training and generation adapters still disagreed
+        on one token, and they differ only in being two FlashInfer instances
+        rather than one. mxfp8 has no training forward to compare against, so
+        two generation instances stand in -- the question is whether an
+        instance resolves its own tile configuration, not which pass owns it.
+
+        Weights are copied before either layer's first forward: the quantized
+        precisions let FlashInfer snapshot and quantize during preprocessing,
+        and a copy afterwards would not reach the snapshot.
+        """
+        if self.EXPERTS % EP_SIZE:
+            pytest.skip(f"{self.EXPERTS} experts do not divide EP={EP_SIZE}")
+
+        overrides = dict(
+            num_moe_experts=self.EXPERTS,
+            inference_mega_max_tokens_per_rank=self.TOKENS,
+            inference_mega_precision=precision,
+        )
+        if precision != "bf16":
+            overrides["inference_moe_disable_fused_quant_kernels"] = True
+
+        try:
+            first = _build_layer(_config(mega_training=False, **overrides), for_inference=True)
+            second = _build_layer(_config(mega_training=False, **overrides), for_inference=True)
+        except (ValueError, NotImplementedError, ImportError) as error:
+            pytest.skip(f"{precision} unavailable in this build: {error}")
+        _copy_expert_weights(first, second)
+
+        worst = 0.0
+        differed_total = 0
+        for index, skew in enumerate(self.SKEWS):
+            _skew_router(first, strength=skew, seed=900 + index)
+            _copy_expert_weights(first, second)
+            hidden = _hidden(first.config, seed=950 + index, tokens=self.TOKENS)
+
+            with torch.no_grad(), InferenceMode.active():
+                a, _ = first(hidden)
+                b, _ = second(hidden)
+            error, differed = _measure_token_count_parity(
+                a, b, f"{precision}: two instances, equal width (skew={skew})"
+            )
+            worst = max(worst, error)
+            differed_total += differed
+
+        if torch.distributed.get_rank() == 0:
+            verdict = "instance-dependent" if differed_total else "instance-independent"
+            print(
+                f"[mega-metric] {precision} two instances: {differed_total}/"
+                f"{len(self.SKEWS) * self.TOKENS} tokens differ -> {verdict}",
+                flush=True,
+            )
+
+        assert differed_total == 0 and worst < 1e-6, (
+            f"two {precision} instances with identical weights disagree on "
+            f"{differed_total} tokens (rel_rms={worst:.3e}) at equal width. Building one "
+            "FlashInfer layer per pass is then enough to break bitwise parity on its own, "
+            "independent of the kernel's arithmetic."
         )
