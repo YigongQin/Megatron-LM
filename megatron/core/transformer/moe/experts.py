@@ -1277,8 +1277,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 # Colocated RL drives both through this one module, so both have
                 # to exist. Each builds its mega layer lazily, so a training-only
                 # or inference-only job pays for just one.
-                self._mega_training_adapter = MegatronMegaMoEAdapter(
-                    config=config, ep_group=self.ep_group, owns_transformed_weights=True
+                #
+                # Shared across layers, unlike the generation adapter above,
+                # because every layer hands it the same scratch buffer. One
+                # FlashInfer layer per MoE layer meant one cap-sized workspace
+                # per MoE layer, which dominated the model's memory.
+                self._mega_training_adapter = MegatronMegaMoEAdapter.shared_for_training(
+                    config=config, ep_group=self.ep_group
                 )
         # Driven by MoELayer, which owns the distinction between the pass that
         # produces the layer output and the recompute pass that builds the
