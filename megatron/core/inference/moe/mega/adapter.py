@@ -36,7 +36,13 @@ class MegatronMegaMoEAdapter:
     are already in the kernel's layout and keeps rewriting them in place, and
     FlashInfer's own preprocessing is bypassed so it cannot snapshot anything.
     See :mod:`megatron.core.inference.moe.mega.training_weights`.
+
+    The training forward shares one adapter across every MoE layer; see
+    :meth:`shared_for_training`. Generation cannot, because each of its layers
+    binds its own persistent weight buffer.
     """
+
+    _shared_training: Optional["MegatronMegaMoEAdapter"] = None
 
     def __init__(
         self,
@@ -50,6 +56,79 @@ class MegatronMegaMoEAdapter:
         self._layer: Optional[MoEEpMegaLayer] = None
         self._warmed_up = False
         self._owns_transformed_weights = owns_transformed_weights
+        self._key: Optional[tuple] = None
+        # data_ptrs the layer was constructed against, for the shared training
+        # adapter's check that every layer really does hand it the same buffer.
+        self._bound_weights: Optional[tuple[int, int]] = None
+
+    @staticmethod
+    def _training_key(config: "TransformerConfig", ep_group) -> tuple:
+        """The geometry a shared training layer is valid for.
+
+        The EP group enters by its member ranks rather than by ``id()``. Two
+        distinct group objects over the same ranks are interchangeable here, and
+        keying on identity would reject the second one for a geometry difference
+        that does not exist.
+        """
+        try:
+            ep = tuple(torch.distributed.get_process_group_ranks(ep_group))
+        except Exception:  # pylint: disable=broad-except
+            # Any group this cannot describe, including None for a single rank.
+            ep = (get_pg_size(ep_group), get_pg_rank(ep_group))
+        return (
+            config.num_moe_experts,
+            config.hidden_size,
+            config.moe_ffn_hidden_size,
+            config.moe_router_topk,
+            config.inference_mega_max_tokens_per_rank,
+            config.inference_mega_precision,
+            ep,
+        )
+
+    @classmethod
+    def shared_for_training(
+        cls, config: "TransformerConfig", ep_group: torch.distributed.ProcessGroup
+    ) -> "MegatronMegaMoEAdapter":
+        """The one training adapter for this process, allocating it on first use.
+
+        ``MoEEpMegaLayer`` holds a workspace sized by ``max_tokens_per_rank``,
+        and one per MoE layer made that workspace the dominant memory term of
+        the whole model: a log-prob pass at a 40960-token cap ran a 48-layer
+        model roughly 110 GB above the reference path, and out of memory. The
+        weight buffer these layers read was already a process-wide singleton for
+        the same reason (see
+        :class:`~megatron.core.inference.moe.mega.training_weights.MegaTrainingWeightScratch`);
+        this applies that to the kernel beside it.
+
+        Sharing is sound because every MoE layer constructs its layer from the
+        same thing. The weights come from ``kernel_layout_from_parameters``,
+        which returns views of that one scratch buffer, and the geometry and EP
+        group are model-wide. Each layer repacks the scratch immediately before
+        its own forward, so a shared kernel reading it sees that layer's
+        weights. :meth:`_ensure_layer` checks the buffer identity rather than
+        trusting it, and a second geometry is rejected instead of silently
+        allocating another multi-GiB workspace.
+
+        Warmup is shared too, which removes the other cost of the per-layer
+        arrangement: one CuTeDSL compilation per process rather than one per
+        layer.
+        """
+        key = cls._training_key(config, ep_group)
+        if cls._shared_training is None:
+            cls._shared_training = cls(config, ep_group, owns_transformed_weights=True)
+            cls._shared_training._key = key
+        elif cls._shared_training._key != key:
+            raise RuntimeError(
+                "the mega training adapter is shared across MoE layers and was built "
+                f"for {cls._shared_training._key}, but a layer requested {key}. Mixed "
+                "expert geometries in one process are not supported."
+            )
+        return cls._shared_training
+
+    @classmethod
+    def reset_shared_training(cls) -> None:
+        """Drop the shared training adapter. For teardown between tests."""
+        cls._shared_training = None
 
     def _fleet_params(self) -> FleetParams:
         # dtype_bytes/algorithm/layout are split-transport fields the mega path
@@ -74,6 +153,8 @@ class MegatronMegaMoEAdapter:
         fc2_weight: torch.Tensor,
     ) -> MoEEpMegaLayer:
         if self._layer is not None:
+            if self._owns_transformed_weights:
+                self._assert_bound_to(fc1_weight, fc2_weight)
             return self._layer
         # Construction runs collective symmetric-heap bootstrap and weight
         # preprocessing, neither of which can be captured.
@@ -107,7 +188,26 @@ class MegatronMegaMoEAdapter:
             weights,
             mega_config,
         )
+        if self._owns_transformed_weights:
+            self._bound_weights = (fc1_weight.data_ptr(), fc2_weight.data_ptr())
         return self._layer
+
+    def _assert_bound_to(self, fc1_weight: torch.Tensor, fc2_weight: torch.Tensor) -> None:
+        """Fail if the caller's weight buffer is not the one the kernel reads.
+
+        FlashInfer binds ``transformed_weights`` at construction, so a caller
+        that later hands over a different buffer would be silently ignored and
+        the kernel would keep reading the first one. Cheap to check, and the
+        alternative is wrong numbers with nothing to show for them. Compared by
+        address because ``views()`` returns a fresh transpose each call.
+        """
+        got = (fc1_weight.data_ptr(), fc2_weight.data_ptr())
+        if self._bound_weights != got:
+            raise RuntimeError(
+                "the mega layer was constructed against a different weight buffer "
+                f"(bound {self._bound_weights}, got {got}). Caller-owned weights must "
+                "stay in the same storage for the kernel to see writes to them."
+            )
 
     def forward(
         self,

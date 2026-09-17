@@ -354,6 +354,7 @@ def _measure_scalar(value, label):
 
 @pytest.fixture(autouse=True)
 def _parallel_state():
+    from megatron.core.inference.moe.mega import MegatronMegaMoEAdapter
     from megatron.core.transformer.moe.token_dispatcher_inference import (
         InferenceAllGatherDispatcherBase,
     )
@@ -380,9 +381,14 @@ def _parallel_state():
     # Both are process-wide; leaking them would let one test's inference setup
     # mask a missing allocation in the next.
     InferenceAllGatherDispatcherBase._valid_tokens_tensor = None
+    # Also process-wide, and it holds a FlashInfer layer pinned to one geometry.
+    # Leaked into a test that builds a different one, it raises rather than
+    # quietly misbehaving -- but it would raise in the wrong test.
+    MegatronMegaMoEAdapter.reset_shared_training()
     yield
     MegaTrainingWeightScratch.reset()
     InferenceAllGatherDispatcherBase._valid_tokens_tensor = None
+    MegatronMegaMoEAdapter.reset_shared_training()
     if BATCH_INVARIANT:
         disable_batch_invariant_mode()
     Utils.destroy_model_parallel()
