@@ -240,6 +240,12 @@ for phase in $PHASES; do
             selector="-k 'TestParityAfterARouterUpdate'"
             launches=${UPDATE_RUNS:-3}
             ;;
+        precision)
+            ranks=$GPUS
+            target=$FORWARD
+            selector="-k 'TestKernelBatchInvarianceByPrecision'"
+            launches=1
+            ;;
         ragged)
             ranks=$GPUS
             target=$FORWARD
@@ -272,7 +278,7 @@ for phase in $PHASES; do
             launches=1
             ;;
         *)
-            echo "unknown phase=$phase (weights|parity|loop|gen|block|update|refit|ties|ragged|attribution|forward|all)" >&2
+            echo "unknown phase=$phase (weights|parity|loop|gen|block|update|refit|ties|ragged|precision|attribution|forward|all)" >&2
             exit 2
             ;;
     esac

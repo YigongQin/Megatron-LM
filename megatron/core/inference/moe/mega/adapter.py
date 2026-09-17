@@ -139,9 +139,21 @@ class MegatronMegaMoEAdapter:
             layer.warmup()
             self._warmed_up = True
 
+        # Canonical expert order, so the result depends on the token and not on
+        # which pass produced the list. Generation hands over
+        # InferenceTopKRouter's top-k in descending score order; the training
+        # forward recovers the same set from TopKRouter's dense mask in mask
+        # order. The kernel combines prob*expert_out in the order given and
+        # float addition is not associative, so the two orders returned
+        # different last bits on a small fraction of tokens -- rare enough to
+        # look like sporadic noise in an RL log-prob pass, and fatal to a
+        # zero-KL run that needs the rollout and the scoring pass to agree
+        # bitwise. Expert ids are unique within a token, so the sort is total
+        # and needs no tie-break.
+        order = routing_map.argsort(dim=-1)
         tensors = MoEEpTensors(
             hidden_states=hidden_states.contiguous(),
-            topk_ids=routing_map,
-            topk_weights=probs.to(torch.float32),
+            topk_ids=routing_map.gather(-1, order),
+            topk_weights=probs.to(torch.float32).gather(-1, order),
         )
         return layer.forward(tensors)
