@@ -595,5 +595,8 @@ def reshard_model_weights(
                 refreshed = bool(refresh_mega()) or refreshed
         if refreshed:
             # Repacking is asynchronous. Synchronize before another stream replays graphs
-            # that read these derived weight buffers.
-            torch.cuda.synchronize()
+            # that read these derived weight buffers. Scoped to this stream because the
+            # repack is a set of copy_ calls issued on it, so it is the only one that
+            # has to drain; the device-wide form additionally waits on the suspended
+            # inference engine's streams for no reason.
+            torch.cuda.current_stream().synchronize()

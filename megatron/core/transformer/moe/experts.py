@@ -1558,6 +1558,15 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
         return output, None
 
+    # Allocated with inference mode off, like _build_concatenated_weights above and
+    # for the same reason. The buffer is created lazily by the first generation
+    # forward, which runs under inference_mode; a tensor allocated there is an
+    # inference tensor, and PyTorch rejects the refit's in-place rewrite of one
+    # from its own ordinary mode. Disabling the mode for the allocation keeps it an
+    # ordinary tensor, which is what makes the in-place refit the docstring below
+    # describes actually possible.
+    @torch.inference_mode(False)
+    @torch.no_grad()
     def _mega_inference_weights(self):
         """Kernel-layout expert weights for the generation megakernel.
 
@@ -1583,13 +1592,21 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 device=self._fc1_weight.device,
             )
         if self._mega_weights_stale:
-            experts = range(self.num_local_experts)
-            self._mega_weights.repack(
-                [self._fc1_weight[i] for i in experts], [self._fc2_weight[i] for i in experts]
-            )
-            self._mega_weights_stale = False
+            self._repack_mega_weights()
         return self._mega_weights.views()
 
+    def _repack_mega_weights(self) -> None:
+        """Rewrite the kernel-layout buffer from the live expert parameters."""
+        experts = range(self.num_local_experts)
+        self._mega_weights.repack(
+            [self._fc1_weight[i] for i in experts], [self._fc2_weight[i] for i in experts]
+        )
+        self._mega_weights_stale = False
+
+    # Matching refresh_flashinfer_mxfp8_weights above: the refit calls this from
+    # ordinary mode, and both write derived expert weights in place.
+    @torch.inference_mode(False)
+    @torch.no_grad()
     def refresh_mega_weights(self) -> bool:
         """Re-derive the megakernel's expert weights after a refit.
 
@@ -1597,9 +1614,17 @@ class InferenceGroupedMLP(TEGroupedMLP):
         same way ``refresh_flashinfer_mxfp8_weights`` is. Returns whether
         anything was refreshed.
 
-        The repack is deferred to the next forward rather than done here: refit
-        runs outside generation, so there is no reason to pay it before the
-        weights are needed, and deferring keeps it off refit's critical path.
+        The repack happens here rather than lazily on the next forward. It is
+        the more expensive placement -- refit runs outside generation, so the
+        work could have waited until the weights were needed -- but a lazy
+        repack sits behind a Python ``if`` inside the forward, and CUDA graph
+        replay executes no Python. Under graphs the refreshed weights would
+        never be written and generation would replay the pre-refit experts
+        indefinitely, with no error to show for it.
+
+        Writing now is safe for graphs because the buffer is allocated once and
+        :meth:`MegaKernelWeightBuffer.repack` fills it with ``copy_``: the
+        pointers a graph captured stay valid and only the contents change.
         """
         if self._mega_adapter is None:
             return False
@@ -1613,6 +1638,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 "inference_mega_precision='bf16' for RL, or rebuild the engine per refit."
             )
         self._mega_weights_stale = True
+        if self._mega_weights is not None:
+            # Only once the buffer exists. Before the first generation forward
+            # there is nothing captured and nothing to refresh, and the
+            # parameters may not have been redirected into _fc1_weight yet.
+            self._repack_mega_weights()
         return True
 
     def _mega_forward(self, hidden_states, probs, routing_map):
