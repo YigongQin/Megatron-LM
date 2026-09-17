@@ -847,7 +847,13 @@ class TestGenerationWeightOwnership:
         layer = _build_layer(config, for_inference=True).eval()
         hidden = _hidden(config, seed=6)
 
-        with torch.no_grad(), InferenceMode.active():
+        # inference_mode rather than no_grad, here and below, because the engine
+        # generates under it and the weight buffer is allocated by the first
+        # generation forward. Allocated under inference_mode it is an inference
+        # tensor, which PyTorch refuses to let the refit write in place from its
+        # own ordinary mode -- the exact failure this class exists to catch.
+        # no_grad does not mark tensors that way and hides it.
+        with torch.inference_mode(), InferenceMode.active():
             before, _ = layer(hidden)
             # Cloned because FlashInfer may hand back a workspace tensor it
             # overwrites on the next call, which would make the comparison
@@ -855,7 +861,7 @@ class TestGenerationWeightOwnership:
             before = before.clone()
 
         _bump_expert_weights(layer)
-        with torch.no_grad(), InferenceMode.active():
+        with torch.inference_mode(), InferenceMode.active():
             stale, _ = layer(hidden)
         assert torch.equal(before, stale), (
             "the kernel picked up a parameter write with no refresh, so the "
@@ -864,7 +870,7 @@ class TestGenerationWeightOwnership:
         )
 
         assert layer.experts.refresh_mega_weights() is True
-        with torch.no_grad(), InferenceMode.active():
+        with torch.inference_mode(), InferenceMode.active():
             refreshed, _ = layer(hidden)
         assert not torch.equal(before, refreshed), (
             "refresh_mega_weights() did not reach the kernel: generation still "
@@ -885,7 +891,7 @@ class TestGenerationWeightOwnership:
 
         # The first forward is what binds the kernel to the pre-refit weights;
         # without it there would be nothing stale to refresh.
-        with torch.no_grad(), InferenceMode.active():
+        with torch.inference_mode(), InferenceMode.active():
             refitted(hidden)
         _bump_expert_weights(refitted)
         assert refitted.experts.refresh_mega_weights() is True
@@ -893,7 +899,7 @@ class TestGenerationWeightOwnership:
         reference = _build_layer(config, for_inference=True).eval()
         _copy_expert_weights(refitted, reference)
 
-        with torch.no_grad(), InferenceMode.active():
+        with torch.inference_mode(), InferenceMode.active():
             refitted_out, _ = refitted(hidden)
             reference_out, _ = reference(hidden)
 
