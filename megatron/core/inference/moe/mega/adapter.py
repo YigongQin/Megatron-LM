@@ -151,10 +151,12 @@ class MegatronMegaMoEAdapter:
         self,
         fc1_weight: torch.Tensor,
         fc2_weight: torch.Tensor,
+        fc1_scale: Optional[torch.Tensor] = None,
+        fc2_scale: Optional[torch.Tensor] = None,
     ) -> MoEEpMegaLayer:
         if self._layer is not None:
             if self._owns_transformed_weights:
-                self._assert_bound_to(fc1_weight, fc2_weight)
+                self._assert_bound_to(fc1_weight, fc2_weight, fc1_scale, fc2_scale)
             return self._layer
         # Construction runs collective symmetric-heap bootstrap and weight
         # preprocessing, neither of which can be captured.
@@ -177,7 +179,10 @@ class MegatronMegaMoEAdapter:
             mega_config = MegaConfig(
                 megakernel=megakernel,
                 preprocess_weights=False,
-                transformed_weights=((fc1_weight, None), (fc2_weight, None)),
+                # The scale slots are None for bf16 and carry the swizzled block
+                # scales for mxfp8, which is the shape the quantized kernels
+                # validate transformed_weights against.
+                transformed_weights=((fc1_weight, fc1_scale), (fc2_weight, fc2_scale)),
             )
         else:
             weights = megatron_grouped_weights_to_moe_pack(fc1_weight, fc2_weight)
@@ -189,10 +194,20 @@ class MegatronMegaMoEAdapter:
             mega_config,
         )
         if self._owns_transformed_weights:
-            self._bound_weights = (fc1_weight.data_ptr(), fc2_weight.data_ptr())
+            self._bound_weights = self._addresses(fc1_weight, fc2_weight, fc1_scale, fc2_scale)
         return self._layer
 
-    def _assert_bound_to(self, fc1_weight: torch.Tensor, fc2_weight: torch.Tensor) -> None:
+    @staticmethod
+    def _addresses(*tensors: Optional[torch.Tensor]) -> tuple:
+        return tuple(None if tensor is None else tensor.data_ptr() for tensor in tensors)
+
+    def _assert_bound_to(
+        self,
+        fc1_weight: torch.Tensor,
+        fc2_weight: torch.Tensor,
+        fc1_scale: Optional[torch.Tensor] = None,
+        fc2_scale: Optional[torch.Tensor] = None,
+    ) -> None:
         """Fail if the caller's weight buffer is not the one the kernel reads.
 
         FlashInfer binds ``transformed_weights`` at construction, so a caller
@@ -201,7 +216,7 @@ class MegatronMegaMoEAdapter:
         alternative is wrong numbers with nothing to show for them. Compared by
         address because ``views()`` returns a fresh transpose each call.
         """
-        got = (fc1_weight.data_ptr(), fc2_weight.data_ptr())
+        got = self._addresses(fc1_weight, fc2_weight, fc1_scale, fc2_scale)
         if self._bound_weights != got:
             raise RuntimeError(
                 "the mega layer was constructed against a different weight buffer "
@@ -216,6 +231,8 @@ class MegatronMegaMoEAdapter:
         probs: torch.Tensor,
         fc1_weight: torch.Tensor,
         fc2_weight: torch.Tensor,
+        fc1_scale: Optional[torch.Tensor] = None,
+        fc2_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run local-token mega MoE; EP communication is inside the kernel."""
         num_tokens = hidden_states.shape[0]
@@ -227,7 +244,7 @@ class MegatronMegaMoEAdapter:
                 "Increase the cap or reduce batch tokens per EP rank."
             )
 
-        layer = self._ensure_layer(fc1_weight, fc2_weight)
+        layer = self._ensure_layer(fc1_weight, fc2_weight, fc1_scale, fc2_scale)
         if not self._warmed_up:
             # warmup() is an EP collective that forces workspace allocation and
             # CuTeDSL compilation; both are illegal under capture.

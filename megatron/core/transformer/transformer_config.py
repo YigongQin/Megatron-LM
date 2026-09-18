@@ -1395,9 +1395,27 @@ class TransformerConfig(ModelParallelConfig):
     reported forward comes from the mega kernel; in bf16 the two differ only by
     rounding, but they are not bitwise equal.
 
-    Restricted to inference_mega_precision='bf16': a quantized forward against a
+    Restricted to inference_mega_precision='bf16' unless
+    moe_mega_training_straight_through is set: a quantized forward against a
     bf16 backward is a straight-through estimator, which is a training-recipe
     decision rather than a drop-in."""
+
+    moe_mega_training_straight_through: bool = False
+    """Allow moe_mega_training_forward at a quantized inference_mega_precision.
+
+    Opt-in because of what it does to the gradient, not because it is unfinished.
+    The mega kernel produces the forward value at the quantized precision while
+    the backward still comes from the TE bf16 recompute, so the gradient is that
+    of the bf16 function rather than of the function that produced the value --
+    a straight-through estimator, with the convergence consequences that implies.
+
+    Train/generation parity is preserved, which is the reason to want it: both
+    sides run the same kernel at the same precision on the same weights, so the
+    forward is bitwise identical and the importance ratio stays clean. What is
+    given up is gradient fidelity, so it belongs in the recipe rather than
+    arriving with a backend flag. Only mxfp8 is supported; the remaining
+    precisions cannot rebuild their kernel weights from the parameters, so their
+    training forward has no packer."""
 
     inference_moe_disable_fused_quant_kernels: bool = False
     """When False (default), use fused kernels that combine permute/activation with
@@ -2035,11 +2053,25 @@ class TransformerConfig(ModelParallelConfig):
                     f"inference_grouped_gemm_backend='flashinfer_mega'; got '{backend}'."
                 )
             if self.inference_mega_precision != 'bf16':
-                raise ValueError(
-                    "moe_mega_training_forward requires inference_mega_precision='bf16'. "
-                    f"'{self.inference_mega_precision}' would pair a quantized forward "
-                    "with a bf16 recomputed backward, i.e. a straight-through estimator."
-                )
+                if not self.moe_mega_training_straight_through:
+                    raise ValueError(
+                        "moe_mega_training_forward requires "
+                        "inference_mega_precision='bf16'. "
+                        f"'{self.inference_mega_precision}' would pair a quantized "
+                        "forward with a bf16 recomputed backward, i.e. a "
+                        "straight-through estimator. Set "
+                        "moe_mega_training_straight_through=True to accept that."
+                    )
+                # Only mxfp8 has a training packer; the rest let FlashInfer
+                # preprocess, which snapshots weights the optimizer then moves.
+                if self.inference_mega_precision != 'mxfp8':
+                    raise ValueError(
+                        "moe_mega_training_straight_through supports "
+                        "inference_mega_precision='mxfp8'; got "
+                        f"'{self.inference_mega_precision}'. The training forward has "
+                        "to rebuild the kernel's weights from the live parameters every "
+                        "step, and only bf16 and mxfp8 can be rebuilt."
+                    )
             # The mega forward saves no intermediates, so there is nothing to build a
             # backward from unless the layer is recomputed.
             if self.recompute_granularity != 'selective' or (
@@ -2179,6 +2211,14 @@ class TransformerConfig(ModelParallelConfig):
                         "batch_invariant_mode with inference-optimized MoE and expert "
                         "parallelism requires inference_moe_token_dispatcher_type='nvls'."
                     )
+
+        if self.moe_mega_training_straight_through and not self.moe_mega_training_forward:
+            raise ValueError(
+                "moe_mega_training_straight_through only relaxes a restriction on "
+                "moe_mega_training_forward, which is disabled, so it would do nothing. "
+                "Rejected rather than ignored: it reads as having opted into a "
+                "quantized training forward that is not running."
+            )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
