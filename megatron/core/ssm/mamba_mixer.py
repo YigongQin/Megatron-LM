@@ -659,7 +659,13 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 if self.D_has_hdim
                 else self.cp.get_D()
             ),
-            z=z if not self.rmsnorm else None,
+            # Under batch_invariant_mode the gate goes through the scan rather
+            # than the norm after it, matching ssm_prefill and the buffered
+            # decode replay. The two placements are the same algebra and
+            # different arithmetic, so a training forward that gates outside
+            # cannot reproduce a generation forward that gates inside. The
+            # fused path this method replaces already gates inside the kernel.
+            z=z if (self.config.batch_invariant_mode or not self.rmsnorm) else None,
             dt_bias=self.cp.get_dt_bias().float(),
             dt_softplus=True,
             return_final_states=ssm_state is not None,
@@ -677,7 +683,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         if self.rmsnorm:
             z = rearrange(z, "b l h p -> l b (h p)").contiguous()
             z = self.cp.post_conv_ssm(z)
-            y = self.norm(y, z)
+            # Already consumed by the scan above when batch-invariant.
+            y = self.norm(y, None if self.config.batch_invariant_mode else z)
 
         return y
 
