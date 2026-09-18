@@ -30,6 +30,7 @@ from megatron.core.transformer.moe.token_dispatcher import (
     MoETokenDispatcher,
 )
 from megatron.core.transformer.moe.token_dispatcher_inference import (
+    MegaLocalPassthroughDispatcher,
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
 )
@@ -254,6 +255,12 @@ class MoELayer(BaseMoELayer):
             config.recompute_granularity == 'selective'
             and "shared_experts" in config.recompute_modules
         )
+        # Train/generation parity mode: the mega kernel produces the layer output
+        # and the recompute pass produces the backward graph, so the two passes of
+        # the same checkpointed forward run different expert implementations and
+        # different token dispatchers. True only during the output-producing pass.
+        self.mega_training_forward = config.moe_mega_training_forward
+        self._mega_pass_is_value = False
 
         self.tp_group = pg_collection.tp
 
@@ -401,6 +408,13 @@ class MoELayer(BaseMoELayer):
                     "inference_grouped_gemm_backend='vllm' requires Triton. "
                     "Install triton (pip install triton)."
                 )
+            elif (
+                config.inference_grouped_gemm_backend
+                == InferenceGroupedGemmBackend.FLASHINFER_MEGA
+            ):
+                from megatron.core.inference.moe.mega._deps import require_flashinfer_moe_ep
+
+                require_flashinfer_moe_ep()
             self._setup_inference_mode(pg_collection)
 
         # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
@@ -420,9 +434,18 @@ class MoELayer(BaseMoELayer):
         `InferenceMode.is_active()`.
         """
         dispatcher_type = self.config.inference_moe_token_dispatcher_type
-        dispatcher_cls = (
-            NVLSAllGatherVDispatcher if dispatcher_type == 'nvls' else NCCLAllGatherDispatcher
-        )
+        if (
+            self.config.inference_grouped_gemm_backend
+            == InferenceGroupedGemmBackend.FLASHINFER_MEGA
+        ):
+            # The megakernel owns EP transport, so inference_moe_token_dispatcher_type
+            # does not apply and the shared-expert overlap wiring below stays off.
+            dispatcher_type = 'mega'
+            dispatcher_cls = MegaLocalPassthroughDispatcher
+        else:
+            dispatcher_cls = (
+                NVLSAllGatherVDispatcher if dispatcher_type == 'nvls' else NCCLAllGatherDispatcher
+            )
 
         self._training_token_dispatcher = self.token_dispatcher
         self._inference_token_dispatcher = dispatcher_cls(
@@ -568,7 +591,14 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        if hasattr(self, "_inference_token_dispatcher") and InferenceMode.is_active():
+        # The mega kernel does its own routing, so it needs the routing map rather
+        # than pre-permuted tokens. True for inference and for the value pass of
+        # the parity-mode training forward.
+        needs_routing_map = hasattr(self, "_inference_token_dispatcher") and (
+            InferenceMode.is_active()
+            or isinstance(self.token_dispatcher, MegaLocalPassthroughDispatcher)
+        )
+        if needs_routing_map:
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
@@ -679,6 +709,22 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+            if self._mega_forward_applies():
+                # The mega kernel consumes undispatched local tokens and does its
+                # own EP transport, so the value pass bypasses dispatch/combine
+                # while the recompute pass needs the real ones to build wgrad.
+                use_mega = self._mega_pass_is_value
+                self.token_dispatcher = (
+                    self._inference_token_dispatcher
+                    if use_mega
+                    else self._training_token_dispatcher
+                )
+                self.shared_expert_overlap = (
+                    False if use_mega else self.config.moe_shared_expert_overlap
+                )
+                self.experts._in_mega_recompute = not use_mega
+                # Consumed: any later invocation of this closure is a recompute.
+                self._mega_pass_is_value = False
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
@@ -721,6 +767,11 @@ class MoELayer(BaseMoELayer):
 
             return output, mlp_bias
 
+        # Mark the next custom_forward invocation as the output-producing pass.
+        # custom_forward clears this, so the recompute triggered from backward
+        # takes the TE path.
+        self._mega_pass_is_value = self._mega_forward_applies()
+
         if self.moe_layer_recompute and self.training:
             if self.config.fp8 or self.config.fp4:
                 outputs = te_checkpoint(
@@ -740,6 +791,24 @@ class MoELayer(BaseMoELayer):
             outputs = custom_forward(hidden_states, intermediate_tensors, padding_mask)
 
         return outputs
+
+    def _mega_forward_applies(self) -> bool:
+        """Whether this module's forward should route expert compute through mega.
+
+        Deliberately not conditioned on ``self.training``. The pass that has to
+        match generation is the log-prob forward, and RL frameworks run that
+        under ``model.eval()`` -- gating on training mode would quietly send
+        exactly that pass down the TE path and leave it the ~6e-3 away from
+        generation that this mode exists to close.
+
+        Eval needs no recompute to pair with: without grad there is no backward
+        to rebuild, so the single ``custom_forward`` call is the value pass.
+
+        ``InferenceMode`` is excluded because the inference engine reaches the
+        kernel through the inference dispatcher and the experts' own inference
+        adapter, which owns its weights separately from the training scratch.
+        """
+        return self.mega_training_forward and not InferenceMode.is_active()
 
     def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):
         """Compute weight gradients for experts and shared experts."""
