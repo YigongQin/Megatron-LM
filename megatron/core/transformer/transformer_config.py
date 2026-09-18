@@ -3872,6 +3872,36 @@ class TransformerConfig(ModelParallelConfig):
                 "training and inference attention paths run the same batch-invariant "
                 f"FlashAttention kernel (got {self.flash_attention_version})."
             )
+            # Same requirement as the FlashAttention pin above, for the SSM
+            # mixers: training and inference have to run one kernel. The
+            # memory-efficient path fuses the conv, the scan and the gated norm
+            # into mamba_split_conv1d_scan_combined, and no inference path
+            # calls it -- dynamic prefill and the buffered decode replay both
+            # reduce to mamba_chunk_scan_combined, which is what the unfused
+            # path runs. Left on, a batch-invariant hybrid model trains on a
+            # kernel it never generates with, and nothing else reports it.
+            assert self.is_hybrid_model is False or not self.use_mamba_mem_eff_path, (
+                "Batch invariant mode requires use_mamba_mem_eff_path=False "
+                "(--disable-mamba-mem-eff-path) on hybrid models, so the training SSM "
+                "forward runs the same chunk scan as prefill and decode. Note that the "
+                "unfused path rejects packed sequences."
+            )
+            if self.is_hybrid_model:
+                from megatron.core.ssm.ops.common.determinism import use_deterministic_mode
+
+                # Checked rather than set. The SSM Triton ops choose their
+                # autotune config lists when the module is imported, inside the
+                # @triton.autotune decorator, so by the time any config exists
+                # the choice has already been made and setting the flag here
+                # would change nothing while appearing to. The only thing that
+                # works is having it true before Megatron imports those
+                # modules, which means the launch environment.
+                assert use_deterministic_mode(), (
+                    "Batch invariant mode on a hybrid model requires MAMBA_DETERMINISTIC=1 "
+                    "in the environment before Megatron is imported, so the SSM Triton "
+                    "kernels pin their autotune configs instead of choosing per call "
+                    "shape. Setting it after import has no effect; relaunch with it set."
+                )
             # Context parallelism routes through TE's FA2 fwd/bwd kernels directly, which
             # cannot be pinned to another version; dropout is not batch-invariant.
             assert (
