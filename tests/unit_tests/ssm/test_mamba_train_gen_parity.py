@@ -241,6 +241,156 @@ class TestConvParity:
         )
 
 
+class TestMixerTrainingMatchesPrefill:
+    """The same question as TestScanParity, one level up: does the *layer* agree?
+
+    Everything above compares kernels called directly on synthetic tensors. That
+    leaves the wiring untested -- which projection feeds which kernel, where the
+    gate enters, whether the norm sees it, how the state is threaded -- and the
+    wiring is where the equivalent MoE bug actually lived. Every kernel-level
+    mega test passed while generation and training disagreed, because the
+    adapter handed experts to the kernel in score order on one path and index
+    order on the other. Same kernel, same inputs, different arithmetic.
+
+    So this drives a real ``MambaMixer``: a training forward against the
+    dynamic-inference prefill, through ``in_proj`` and the gated norm, on one
+    set of weights. It is also the only coverage of the ``batch_invariant_mode``
+    branch in ``_static_prefill``, which is the one line of behaviour this work
+    changed.
+
+    Decode is deliberately not repeated here. It reduces to
+    ``mamba_chunk_scan_combined`` by construction and
+    ``test_batch_invariant_decode.py`` already pins that bitwise; the untested
+    edge was always training versus prefill.
+    """
+
+    @staticmethod
+    def _build_mixer():
+        """A real mixer configured the way a parity run configures one."""
+        import torch.nn.functional as F
+
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+        from megatron.core.process_groups_config import ProcessGroupCollection
+        from megatron.core.ssm.mamba_mixer import MambaMixer
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        from megatron.core.transformer import TransformerConfig
+        from megatron.core.transformer.enums import AttnBackend
+        from tests.unit_tests.test_utilities import Utils
+
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            hidden_size=256,
+            num_layers=1,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            activation_func=F.silu,
+            # The parity configuration, not a default one. is_hybrid_model is
+            # what makes __post_init__ apply the SSM-specific checks, so
+            # building this config is itself a test of them.
+            is_hybrid_model=True,
+            use_mamba_mem_eff_path=False,
+            batch_invariant_mode=True,
+            batch_invariant_backend="te_native",
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+        )
+        submodules = hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        mixer = MambaMixer(
+            config,
+            submodules,
+            config.hidden_size,
+            layer_number=1,
+            pg_collection=pg_collection,
+        )
+        return mixer.cuda().to(torch.bfloat16)
+
+    @staticmethod
+    def _prefill_context(seqlen, device):
+        """The varlen metadata for one request spanning the whole sequence.
+
+        Chunk metadata is left unset on purpose: that selects the fallback
+        which rebuilds chunk boundaries from cu_seqlens, so this test does not
+        depend on the scheduler agreeing with it. No slot allocator means
+        intermediate extraction (prefix caching) stays off, which is also how
+        the parity recipe runs it.
+        """
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            mamba_metadata=SimpleNamespace(
+                seq_idx=torch.zeros((1, seqlen), dtype=torch.int32, device=device),
+                cu_seqlens=torch.tensor([0, seqlen], dtype=torch.int32, device=device),
+                batch_indices_prefill=torch.tensor([0], dtype=torch.long, device=device),
+                intermediate_chunk_indices=None,
+                intermediate_abs_positions=None,
+                intermediate_real_count=None,
+                cu_chunk_seqlens=None,
+                last_chunk_indices=None,
+                seq_idx_for_varlen=None,
+                conv_seq_idx=None,
+                conv_seq_start=None,
+            ),
+            mamba_slot_allocator=None,
+        )
+
+    def test_training_forward_matches_dynamic_prefill(self):
+        """Bitwise, through the real module on one set of weights."""
+        mixer = self._build_mixer()
+        try:
+            device = torch.device("cuda")
+            # Two chunks, so the state-passing carry between them is exercised.
+            # A sequence inside a single chunk can agree while the carry does
+            # not, and the carry is what a rollout depends on.
+            seqlen = 2 * mixer.chunk_size
+            torch.manual_seed(0)
+            hidden = torch.randn(
+                seqlen, 1, mixer.config.hidden_size, device=device, dtype=torch.bfloat16
+            )
+
+            train_out, _ = mixer(hidden)
+
+            # Mirror forward()'s tail rather than calling forward again: the
+            # inference branch needs a context, and reproducing the same three
+            # steps (project, run the SSM, project back) is what makes the two
+            # sides comparable at the layer's output.
+            conv_shape, ssm_shape = mixer.mamba_state_shapes_per_request()
+            conv_state = torch.zeros(1, *conv_shape, device=device, dtype=torch.bfloat16)
+            ssm_state = torch.zeros(1, *ssm_shape, device=device, dtype=torch.bfloat16)
+            with torch.inference_mode():
+                zxBCdt, _ = mixer.in_proj(hidden)
+                y = mixer.ssm_prefill(
+                    zxBCdt=zxBCdt,
+                    conv_state=conv_state,
+                    ssm_state=ssm_state,
+                    context=self._prefill_context(seqlen, device),
+                )
+                prefill_out, _ = mixer.out_proj(y.reshape(seqlen, 1, -1))
+
+            same = _report(
+                "mixer training forward vs dynamic prefill",
+                train_out.reshape(-1),
+                prefill_out.reshape(-1),
+            )
+            assert same, (
+                "the mixer's training forward does not reproduce its own prefill "
+                "bitwise, even though the underlying kernels do (TestScanParity). "
+                "That points at the wiring rather than the kernels: gate placement "
+                "in _static_prefill, the gated norm, or the conv state. This is the "
+                "MoE expert-ordering failure in a different layer, and it cannot be "
+                "found by comparing kernels."
+            )
+        finally:
+            from tests.unit_tests.test_utilities import Utils
+
+            Utils.destroy_model_parallel()
+
+
 class TestGatePlacement:
     """The two places the gate can enter, and what choosing wrongly costs.
 
