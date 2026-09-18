@@ -1153,6 +1153,16 @@ class TEGroupedMLP(MegatronModule):
         self.linear_fc1.backward_dw()
 
 
+# Mega precisions whose kernel weights we build and own, so a refit can rewrite
+# them in place instead of rebuilding the layer. bf16 needs only the interleave
+# and transpose; mxfp8 also requantizes, calling FlashInfer's own quantizer so
+# the bytes match what its preprocessing would have produced. The remaining
+# precisions still let FlashInfer preprocess and snapshot. Read by
+# _mega_inference_weights, refresh_mega_weights and the adapter's ownership flag,
+# which have to agree.
+_MEGA_CALLER_OWNED_PRECISIONS = ('bf16', 'mxfp8')
+
+
 class InferenceGroupedMLP(TEGroupedMLP):
     """Inference-optimized GroupedMLP with GPU-resident offsets.
 
@@ -1203,13 +1213,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
         if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER_MEGA:
             from megatron.core.inference.moe.mega import MegatronMegaMoEAdapter
 
-            # bf16 generation owns its transformed weights so a refit can rewrite
-            # them in place; the quantized precisions let FlashInfer preprocess
-            # because that step also quantizes.
             self._mega_adapter = MegatronMegaMoEAdapter(
                 config=config,
                 ep_group=self.ep_group,
-                owns_transformed_weights=config.inference_mega_precision == 'bf16',
+                owns_transformed_weights=(
+                    config.inference_mega_precision in _MEGA_CALLER_OWNED_PRECISIONS
+                ),
             )
             if self._mega_training_forward:
                 # A second adapter even though bf16 makes both caller-owned:
@@ -1481,21 +1490,28 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _mega_inference_weights(self):
         """Kernel-layout expert weights for the generation megakernel.
 
-        Returns ``(fc1, fc2)`` for the adapter, or ``None`` to let FlashInfer
-        preprocess and snapshot them itself.
+        Returns ``(fc1, fc2, fc1_scale, fc2_scale)`` for the adapter -- scales
+        ``None`` unless the precision has them -- or ``None`` to let FlashInfer
+        preprocess and snapshot the weights itself.
 
-        BF16 owns its buffer so that a refit can rewrite it in place. The
-        quantized precisions cannot: FlashInfer's preprocessing quantizes as
-        well as reshaping, and this repack only reshapes, so they keep the
-        snapshotting path and :meth:`refresh_mega_weights` refuses rather than
+        The precisions in ``_MEGA_CALLER_OWNED_PRECISIONS`` own their buffer so
+        that a refit can rewrite it in place. The rest keep the snapshotting
+        path, and :meth:`refresh_mega_weights` refuses for them rather than
         letting generation run on pre-refit experts.
         """
-        if self.config.inference_mega_precision != 'bf16':
+        precision = self.config.inference_mega_precision
+        if precision not in _MEGA_CALLER_OWNED_PRECISIONS:
             return None
-        from megatron.core.inference.moe.mega.training_weights import MegaKernelWeightBuffer
+        from megatron.core.inference.moe.mega.training_weights import (
+            MegaKernelWeightBuffer,
+            MegaMxfp8KernelWeightBuffer,
+        )
 
         if self._mega_weights is None:
-            self._mega_weights = MegaKernelWeightBuffer(
+            buffer_class = (
+                MegaKernelWeightBuffer if precision == 'bf16' else MegaMxfp8KernelWeightBuffer
+            )
+            self._mega_weights = buffer_class(
                 num_local_experts=self.num_local_experts,
                 hidden_size=self.config.hidden_size,
                 intermediate_size=self.config.moe_ffn_hidden_size,
@@ -1504,7 +1520,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
             )
         if self._mega_weights_stale:
             self._repack_mega_weights()
-        return self._mega_weights.views()
+        views = self._mega_weights.views()
+        # bf16 has no scale planes; pad so the adapter takes one shape of tuple.
+        return views if len(views) == 4 else (*views, None, None)
 
     def _repack_mega_weights(self) -> None:
         """Rewrite the kernel-layout buffer from the live expert parameters."""
@@ -1539,14 +1557,15 @@ class InferenceGroupedMLP(TEGroupedMLP):
         """
         if self._mega_adapter is None:
             return False
-        if self.config.inference_mega_precision != 'bf16':
+        if self.config.inference_mega_precision not in _MEGA_CALLER_OWNED_PRECISIONS:
             raise NotImplementedError(
                 "Refitting expert weights under inference_mega_precision="
                 f"{self.config.inference_mega_precision!r} is not supported: FlashInfer "
                 "quantizes the weights when it preprocesses them, so the kernel's copy "
                 "cannot be rebuilt from the parameters alone and generation would keep "
-                "using the weights snapshotted before the refit. Use "
-                "inference_mega_precision='bf16' for RL, or rebuild the engine per refit."
+                "using the weights snapshotted before the refit. Use one of "
+                f"{list(_MEGA_CALLER_OWNED_PRECISIONS)} for RL, or rebuild the engine "
+                "per refit."
             )
         self._mega_weights_stale = True
         if self._mega_weights is not None:
@@ -1562,8 +1581,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         assert self._mega_adapter is not None
         assert probs.dtype == torch.float32, "flashinfer_mega requires fp32 routing probabilities."
         weights = self._mega_inference_weights()
-        fc1_weight, fc2_weight = (
-            (self._fc1_weight, self._fc2_weight) if weights is None else weights
+        fc1_weight, fc2_weight, fc1_scale, fc2_scale = (
+            (self._fc1_weight, self._fc2_weight, None, None) if weights is None else weights
         )
         output = self._mega_adapter.forward(
             hidden_states,
@@ -1571,6 +1590,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             probs,
             fc1_weight,
             fc2_weight,
+            fc1_scale,
+            fc2_scale,
         )
         return output, None
 
@@ -1603,8 +1624,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
         must be consumed by this forward before another layer repacks it.
         """
         from megatron.core.inference.moe.mega.training_weights import (
-            MegaTrainingWeightScratch,
             kernel_layout_from_parameters,
+            training_scratch_class,
         )
 
         assert routing_map is not None, "routing_map is required for flashinfer_mega forward."
@@ -1614,8 +1635,12 @@ class InferenceGroupedMLP(TEGroupedMLP):
         fc1_weights = [getattr(self.linear_fc1, f'weight{i}') for i in experts]
         fc2_weights = [getattr(self.linear_fc2, f'weight{i}') for i in experts]
         owner = id(self)
-        fc1_kernel, fc2_kernel = kernel_layout_from_parameters(
+        packed = kernel_layout_from_parameters(
             self.config, fc1_weights, fc2_weights, owner=owner
+        )
+        # bf16 packs no scales; pad so the adapter takes one shape of tuple.
+        fc1_kernel, fc2_kernel, fc1_scale, fc2_scale = (
+            packed if len(packed) == 4 else (*packed, None, None)
         )
         output = self._mega_training_adapter.forward(
             hidden_states,
@@ -1623,11 +1648,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
             probs.to(torch.float32),
             fc1_kernel,
             fc2_kernel,
+            fc1_scale,
+            fc2_scale,
         )
         # The kernel reads the scratch on this stream inside the call above, so a
         # different owner here means a second MoE layer ran in between and the
         # weights just used were not this layer's.
-        MegaTrainingWeightScratch.get(
+        training_scratch_class(self.config).get(
             num_local_experts=self.num_local_experts,
             hidden_size=self.config.hidden_size,
             intermediate_size=self.config.moe_ffn_hidden_size,

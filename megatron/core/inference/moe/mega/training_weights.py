@@ -33,8 +33,10 @@ snapshotted at construction -- silently, since nothing reads the parameters
 again. Owning the buffer instead means a refit can rewrite it in place and the
 next forward sees new weights, with no teardown, no EP collective and no
 recompile. Memory is unchanged, because FlashInfer holds exactly one
-transformed copy either way. That path is BF16-only; see
-:class:`MegaKernelWeightBuffer`.
+transformed copy either way. That path covers bf16 and mxfp8 -- see
+:class:`MegaKernelWeightBuffer` and :class:`MegaMxfp8KernelWeightBuffer` -- and
+for mxfp8 the rewrite requantizes, calling FlashInfer's own quantizer so the
+bytes match what its preprocessing would have produced.
 """
 
 from __future__ import annotations
@@ -67,9 +69,11 @@ class MegaKernelWeightBuffer:
     FlashInfer's own ``preprocess_mega_weights``, which is what
     ``tests/unit_tests/inference/test_mega_training_weights.py`` pins.
 
-    BF16 only. For the quantized mega precisions FlashInfer's preprocessing also
-    quantizes the weights, and this reproduces only its interleave and
-    transpose, so a quantized layer must let FlashInfer preprocess instead.
+    The buffers themselves are BF16: this reproduces only FlashInfer's interleave
+    and transpose, not the weight quantization the quantized precisions also do
+    during preprocessing. That quantization is a further step on top of these
+    views rather than a reason to give up the owned buffer; see
+    :func:`mxfp8_kernel_weights_from_views`.
     """
 
     def __init__(
@@ -139,25 +143,19 @@ class MegaKernelWeightBuffer:
         return self.views()
 
 
-class MegaTrainingWeightScratch(MegaKernelWeightBuffer):
-    """One process-wide buffer pair, shared by every MoE layer in training.
+class _SharedAcrossLayers:
+    """Singleton and ownership bookkeeping for a scratch every MoE layer shares.
 
-    :meth:`repack` overwrites the buffers from one layer's parameters and
-    returns the views the kernel consumes; they stay valid only until the next
-    :meth:`repack`, hence the ownership check.
+    Mixed in ahead of the buffer being shared, so :meth:`repack` records the
+    owner and then defers to the buffer's own packing. Each subclass keeps its
+    own ``_instance``: assignment through ``cls`` lands on the subclass, so the
+    bf16 and MXFP8 scratches cannot be handed each other's buffers.
     """
 
-    _instance: Optional["MegaTrainingWeightScratch"] = None
+    _instance: Optional["_SharedAcrossLayers"] = None
 
-    def __init__(
-        self,
-        num_local_experts: int,
-        hidden_size: int,
-        intermediate_size: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> None:
-        super().__init__(num_local_experts, hidden_size, intermediate_size, dtype, device)
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
         self._owner: Optional[int] = None
 
     @classmethod
@@ -168,7 +166,7 @@ class MegaTrainingWeightScratch(MegaKernelWeightBuffer):
         intermediate_size: int,
         dtype: torch.dtype,
         device: torch.device,
-    ) -> "MegaTrainingWeightScratch":
+    ) -> "_SharedAcrossLayers":
         """Return the shared scratch, allocating it on first use.
 
         Every MoE layer in a model has the same expert geometry, so one buffer
@@ -198,7 +196,7 @@ class MegaTrainingWeightScratch(MegaKernelWeightBuffer):
         fc1_weights: list[torch.Tensor],
         fc2_weights: list[torch.Tensor],
         owner: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, ...]:
         """Repack for ``owner``, recording it so a stale read can be reported.
 
         Returns views valid only until the next call, unlike the base class,
@@ -223,15 +221,214 @@ class MegaTrainingWeightScratch(MegaKernelWeightBuffer):
             )
 
 
+class MegaMxfp8KernelWeightBuffer:
+    """Persistent kernel-layout MXFP8 expert weights, and the requantize into them.
+
+    The MXFP8 analogue of :class:`MegaKernelWeightBuffer`, and it exists for the
+    same reason: FlashInfer binds the kernel's weights once, so a refit only
+    reaches the kernel if the buffers it reads are ours to rewrite. The
+    difference is that rewriting them means requantizing rather than copying,
+    so this holds the fp8 data and the swizzled scale planes instead of weights
+    in the parameters' own dtype.
+
+    ``cache_staging`` decides whether the bf16 buffer the quantizer reads from is
+    kept. Generation leaves it transient: it repacks only on a refit, and holding
+    a bf16 copy per layer for a whole run would cost more than the fp8 weights
+    themselves. Training keeps it, because it repacks every layer on every step
+    and there is only one shared buffer to keep -- the same bf16 buffer the bf16
+    scratch holds anyway.
+    """
+
+    def __init__(
+        self,
+        num_local_experts: int,
+        hidden_size: int,
+        intermediate_size: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        cache_staging: bool = False,
+    ) -> None:
+        self._key = (num_local_experts, hidden_size, intermediate_size, dtype, device)
+        self._quantized: Optional[tuple[torch.Tensor, ...]] = None
+        self._cache_staging = cache_staging
+        self._staging: Optional[MegaKernelWeightBuffer] = None
+
+    def views(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``(fc1, fc2, fc1_scale, fc2_scale)``, stable across repacks."""
+        if self._quantized is None:
+            raise RuntimeError(
+                "mega MXFP8 kernel weights were read before the first repack. The "
+                "quantized buffers are allocated by the first repack, so the "
+                "parameters have to be packed once before the kernel can be handed them."
+            )
+        return self._quantized
+
+    def repack(
+        self, fc1_weights: list[torch.Tensor], fc2_weights: list[torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Requantize one layer's live expert weights into the kernel's buffers.
+
+        Args:
+            fc1_weights: per-expert ``[2 * intermediate, hidden]`` gate-then-up
+                weights, in local expert order.
+            fc2_weights: per-expert ``[hidden, intermediate]`` weights.
+
+        Returns:
+            The views as :meth:`views`.
+        """
+        staging = self._staging or MegaKernelWeightBuffer(*self._key)
+        if self._cache_staging:
+            self._staging = staging
+        (fc1, fc1_scale), (fc2, fc2_scale) = mxfp8_kernel_weights_from_views(
+            *staging.repack(fc1_weights, fc2_weights)
+        )
+        fresh = (fc1, fc2, fc1_scale, fc2_scale)
+        if self._quantized is None:
+            # The first repack fixes the addresses; every later one writes into
+            # them, so a CUDA graph that captured these pointers stays valid.
+            self._quantized = fresh
+        else:
+            for destination, source in zip(self._quantized, fresh):
+                # Through uint8 because copy_ between fp8 tensors is a byte copy
+                # anyway and not every fp8 dtype has a copy kernel on every build.
+                destination.view(torch.uint8).copy_(source.view(torch.uint8))
+        return self._quantized
+
+
+class MegaTrainingWeightScratch(_SharedAcrossLayers, MegaKernelWeightBuffer):
+    """One process-wide bf16 buffer pair, shared by every MoE layer in training.
+
+    :meth:`repack` overwrites the buffers from one layer's parameters and returns
+    the views the kernel consumes; they stay valid only until the next
+    :meth:`repack`, hence the ownership check.
+    """
+
+    _instance: Optional["MegaTrainingWeightScratch"] = None
+
+
+class MegaMxfp8TrainingWeightScratch(_SharedAcrossLayers, MegaMxfp8KernelWeightBuffer):
+    """The same, quantized: one shared MXFP8 buffer set for every MoE layer.
+
+    Requantizes from the live parameters on every repack, so unlike generation
+    -- where a refit is occasional -- this pays FlashInfer's weight quantizer
+    once per MoE layer per step.
+    """
+
+    _instance: Optional["MegaMxfp8TrainingWeightScratch"] = None
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, cache_staging=True, **kwargs)
+
+
+def reset_training_scratches() -> None:
+    """Drop every shared training scratch. For teardown between tests.
+
+    Both of them, so a test that ran one precision cannot leave a buffer behind
+    for a test running the other -- and so adding a precision does not quietly
+    require every fixture in the tree to be found and updated.
+    """
+    MegaTrainingWeightScratch.reset()
+    MegaMxfp8TrainingWeightScratch.reset()
+
+
+def training_scratch_class(config: "TransformerConfig") -> type:
+    """The shared scratch class the mega training forward packs into.
+
+    Kept in one place because two callers have to agree on it: the repack, and
+    the ownership check that runs after the kernel has read the result.
+    """
+    precision = config.inference_mega_precision
+    if precision == 'bf16':
+        return MegaTrainingWeightScratch
+    if precision == 'mxfp8':
+        return MegaMxfp8TrainingWeightScratch
+    raise NotImplementedError(
+        f"moe_mega_training_forward does not support inference_mega_precision="
+        f"{precision!r}: the training forward packs the kernel's weights itself, "
+        "and only bf16 and mxfp8 have a packer. TransformerConfig rejects this "
+        "combination, so reaching here means that validation was bypassed."
+    )
+
+
+def mxfp8_kernel_weights_from_views(
+    fc1: torch.Tensor, fc2: torch.Tensor
+) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
+    """Quantize bf16 kernel-layout expert weights into kernel-ready MXFP8.
+
+    Composes with :class:`MegaKernelWeightBuffer` rather than repeating it: the
+    buffer already produces the gate/up interleave and the K-major orientation,
+    which is exactly the input FlashInfer quantizes from, so this takes its
+    views and only adds the quantization and the scale swizzle.
+
+    The quantizer and the swizzle are *called*, not reimplemented. FlashInfer's
+    ``preprocess_mega_weights`` derives the MXFP8 block scales itself, and a
+    second implementation would have to stay bit-identical to it across every
+    upgrade to be worth anything -- which is the objection that kept the
+    quantized precisions out of the caller-owned weight path. Both are exported
+    from the ``cutedsl_megamoe`` shim, the same boundary FlashInfer's own
+    backends import them through, so agreement is by construction.
+
+    Args:
+        fc1: ``[E, hidden, 2 * intermediate]`` gate/up-interleaved K-major view,
+            as returned by :meth:`MegaKernelWeightBuffer.views`.
+        fc2: ``[E, intermediate, hidden]`` K-major view.
+
+    Returns:
+        ``((fc1, fc1_sf), (fc2, fc2_sf))``, the layout ``MoEEpMegaLayer`` accepts
+        as ``transformed_weights`` under ``preprocess_weights=False``: fp8 data in
+        the shapes of the inputs, and flat swizzled uint8 scales of shape
+        ``[E, swizzled_sf_size]``. Byte-identical to what
+        ``preprocess_mega_weights`` produces from the same weights, which
+        ``tests/unit_tests/inference/test_mega_training_weights.py`` pins.
+    """
+    from megatron.core.inference.moe.mega._deps import require_flashinfer_moe_ep
+
+    require_flashinfer_moe_ep()
+    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+        _stack_byte_reinterpretable_tensors,
+        mxfp8_quantize_per_block_32,
+        to_blocked,
+    )
+
+    quantized = []
+    for view in (fc1, fc2):
+        num_local_experts = view.shape[0]
+        data_parts = []
+        scale_parts = []
+        for expert in range(num_local_experts):
+            # The quantizer wants the reduction dimension trailing, which is the
+            # transpose of the kernel view. That is the orientation FlashInfer
+            # quantizes in, so the 32-element block boundaries land on the same
+            # elements; quantizing the kernel view directly would block along the
+            # output dimension instead and silently disagree.
+            data, scale = mxfp8_quantize_per_block_32(
+                view[expert].transpose(0, 1).float(), torch.float8_e4m3fn
+            )
+            data_parts.append(data.transpose(0, 1))
+            scale_parts.append(to_blocked(scale))
+        # Stacked through a uint8 view: torch.stack has no kernel for fp8, and
+        # this is the helper FlashInfer stacks its own transformed weights with.
+        stacked_data = _stack_byte_reinterpretable_tensors(data_parts, dim=0)
+        stacked_scale = _stack_byte_reinterpretable_tensors(scale_parts, dim=0)
+        quantized.append(
+            (stacked_data, stacked_scale.view(num_local_experts, scale_parts[0].numel()))
+        )
+    return quantized[0], quantized[1]
+
+
 def kernel_layout_from_parameters(
     config: "TransformerConfig",
     fc1_weights: list[torch.Tensor],
     fc2_weights: list[torch.Tensor],
     owner: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Repack one layer's expert parameters into the shared kernel-layout scratch."""
+) -> tuple[torch.Tensor, ...]:
+    """Repack one layer's expert parameters into the shared kernel-layout scratch.
+
+    Returns ``(fc1, fc2)`` for bf16 and ``(fc1, fc2, fc1_scale, fc2_scale)`` for
+    mxfp8, which is what the adapter takes.
+    """
     num_local_experts = len(fc1_weights)
-    scratch = MegaTrainingWeightScratch.get(
+    scratch = training_scratch_class(config).get(
         num_local_experts=num_local_experts,
         hidden_size=config.hidden_size,
         intermediate_size=config.moe_ffn_hidden_size,

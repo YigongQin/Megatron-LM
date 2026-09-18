@@ -3,7 +3,12 @@
 `inference_grouped_gemm_backend='flashinfer_mega'` accepts four precisions via
 `inference_mega_precision`: `bf16`, `mxfp8`, `nvfp4`, `fp8_fp4`. All four run,
 and all four have been benchmarked and correctness-checked as standalone
-generation. Only `bf16` is usable for RL train/generation parity today.
+generation.
+
+**`bf16` and `mxfp8` are usable for RL train/generation parity. `nvfp4` and
+`fp8_fp4` are not.** mxfp8 was blocked until §1 was resolved for it; what
+follows records both what blocked it and why the way out turned out to be
+cheaper than this document originally estimated.
 
 This is the list of what stands in the way, separated by which of the two
 use cases it blocks, because they are blocked for different reasons and one of
@@ -41,12 +46,30 @@ Ways out, in increasing order of work:
   collective, a symmetric-heap reallocation and a CuTeDSL recompile on every
   refit, and construction is illegal under CUDA graph capture, so every refit
   would also invalidate the graphs.
-- **Quantize into a caller-owned buffer.** Extend `MegaKernelWeightBuffer` to
-  hold the quantized weights and scales and write FlashInfer's quantization
-  ourselves. This means reproducing its scale derivation bit-for-bit per
-  precision (mxfp8 e4m3 32-element groups, nvfp4 16-element groups with the
-  fp8 second-level scale, fp8_fp4's ue8m0 block scales) and keeping it in step
-  with FlashInfer. Four formats, each with its own pinning test.
+- **Quantize into a caller-owned buffer.** *This is what mxfp8 now does.* The
+  estimate here was that it means "reproducing its scale derivation bit-for-bit
+  per precision and keeping it in step with FlashInfer" — four reimplementations
+  to maintain. That was wrong, and the correction is the reusable part: the
+  quantizer and the scale swizzle are exported from the `cutedsl_megamoe` shim
+  (`mxfp8_quantize_per_block_32`, `to_blocked`, `_stack_byte_reinterpretable_tensors`,
+  all in its `__all__`), which is the same boundary FlashInfer's own backends
+  import them through. So `MegaMxfp8KernelWeightBuffer` *calls* them rather than
+  reimplementing them, and agreement is by construction rather than by
+  maintenance.
+
+  Two other things made mxfp8 cheap. The quantizer's input orientation is
+  exactly what the bf16 buffer already produces — FlashInfer interleaves
+  gate/up, transposes to K-major, then quantizes per expert — so
+  `MegaKernelWeightBuffer.views()` is the right input unchanged. And MXFP8
+  weight quantization uses a fixed 1.0 norm with no global amax, so there is no
+  calibration state to keep in sync. `test_mega_training_weights.py`,
+  `TestMxfp8KernelWeights` pins the result byte-for-byte against
+  `preprocess_mega_weights` and checks FlashInfer's own
+  `validate_transformed_mega_weights` accepts it.
+
+  nvfp4 is not blocked by anything new after this, but it has not been done: it
+  needs its own pinning test, and its second-level scale (`input_norm_const`,
+  see §2a) is a trap that mxfp8 does not have.
 - **Ask FlashInfer for an in-place reload.** A `MoEEpMegaLayer` method that
   re-runs preprocessing into the existing transformed tensors, keeping the
   workspace and the compiled kernel. This is the right place for it — the
@@ -55,8 +78,11 @@ Ways out, in increasing order of work:
 
 ## 2. A quantized forward against a bf16 backward — blocks the training forward
 
-`moe_mega_training_forward` is rejected for anything but bf16, in
-`TransformerConfig.__post_init__`. This is a deliberate refusal, not a gap.
+`moe_mega_training_forward` is rejected for anything but bf16 in
+`TransformerConfig.__post_init__` **unless
+`moe_mega_training_straight_through=True`**. This is a deliberate refusal that
+can be waived, not a gap — and the reasoning below is why it is a waiver with a
+name rather than an implicit consequence of choosing a precision.
 
 The parity hybrid runs the megakernel for the forward value and takes the
 gradient from the MoE recompute pass, which runs the ordinary TE bf16
@@ -71,6 +97,58 @@ If quantized generation is wanted alongside a bf16 training forward, the honest
 framing is that train/generation parity is being given up on purpose, and the
 resulting bias belongs in the recipe. Nothing here prevents that combination
 from being built; it just should not arrive via `moe_mega_training_forward`.
+
+**What `moe_mega_training_straight_through` buys, and what it does not.** With
+mxfp8 on *both* sides, train/generation parity is not given up at all: the same
+kernel runs at the same precision on the same weights, so the two forwards are
+bitwise identical — measured at cold=0, warm=0 across repeated launches by
+`TestTrainGenParity::test_training_forward_matches_generation_forward[mxfp8]`.
+The importance ratio stays clean. What is given up is gradient fidelity, exactly
+as described above: the gradient is of the bf16 function while the value is
+mxfp8. Convergence against the bf16 arm has not been measured. So the flag is
+not a correctness escape hatch — it is the recipe stating that it accepts a
+straight-through estimator in exchange for a quantized forward that still has
+parity.
+
+## 2a. Batch invariance and determinism are *not* what blocks them
+
+Measured, so it does not get re-litigated. At 128 experts, EP=4, 1024 tokens and
+three router skews, both quantized kernels are bitwise stable:
+
+| precision | wide vs decode-width | 8 identical relaunches | two built instances |
+| --- | --- | --- | --- |
+| `bf16` | 0 tokens differ | 0 differ | 0 tokens differ |
+| `mxfp8` | 0 tokens differ | 0 differ | 0 tokens differ |
+| `nvfp4` | 0 tokens differ | 0 differ | 0 tokens differ |
+
+`./scripts/local/run_mega_training_tests.sh --precision all` reproduces it
+(`TestKernelBatchInvarianceByPrecision`, `TestKernelDeterminismByPrecision`).
+The tests assert zero differences rather than a tolerance, so the table is what
+a pass means; re-run it rather than trusting these cells, since the phase log is
+overwritten per run and only the nvfp4 one was kept.
+
+nvfp4 passing is worth explaining, because the usual NVFP4 recipe would fail it.
+A calibrated or dynamic per-tensor amax for the second-level scale makes a
+token's quantization depend on what else is in the launch. FlashInfer does not
+compute one: the second-level scale is `input_norm_const`, a static float on the
+kernel config (default 1.0), handed to `stage_mega_moe_inputs`, and the first
+level is `nvfp4_quantize_per_block_16`, whose fp8 scale depends only on the 16
+values inside its own block. Neither level reads outside the token. Weight
+scales are frozen at preprocessing with `norm_const=1.0`.
+
+**So `input_norm_const` must stay static.** It is a plain config field and
+setting it from a measured amax — an obvious-looking accuracy fix — silently
+ends batch invariance. The symptom would be a small fraction of tokens
+disagreeing between the rollout and the log-prob pass, which is the same
+signature as the expert-ordering bug and took days to attribute. `registry.py`
+does not set it.
+
+Two things this does *not* establish. It says the kernels are reproducible, not
+that they are accurate: with `input_norm_const` left at 1.0 and uncalibrated,
+nvfp4 accuracy rests entirely on the per-block-16 scales, and the forward error
+against TE bf16 is a separate measurement. And it does not touch §1 — both
+precisions still snapshot their weights at construction, so refit remains the
+blocker for RL.
 
 ## 3. Megatron-side MXFP8 is a separate thing, and the two do not compose
 
@@ -114,10 +192,19 @@ is closed for colocated RL regardless of the megakernel.
 
 ## Where the tests are
 
-- `tests/unit_tests/inference/test_mega_training_weights.py` pins our repack
-  against FlashInfer's `_interleave_gate_up_32`, and covers the config
-  validation above. CPU-only and single rank.
+- `tests/unit_tests/inference/test_mega_training_weights.py` pins our bf16
+  repack against FlashInfer's `_interleave_gate_up_32` and our mxfp8
+  quantization against its `preprocess_mega_weights`
+  (`TestMxfp8KernelWeights`), and covers the config validation above. CPU-only
+  and single rank: `PHASES=weights`.
 - `tests/unit_tests/inference/test_mega_training_forward.py`,
-  `TestGenerationWeightOwnership` covers the bf16 refit path end to end,
-  including the refusal in §1. `scripts/local/run_mega_training_tests.sh` with
-  `PHASES=gen` runs just that class.
+  `TestGenerationWeightOwnership` covers the refit path end to end for both
+  owned precisions, including the refusal in §1 for the unowned ones.
+  `scripts/local/run_mega_training_tests.sh` with `PHASES=gen` runs just that
+  class. `--precision bf16` or `--precision mxfp8` narrows it to one; the flag
+  selects precisions and does not change which phases run.
+- `TestKernelBatchInvarianceByPrecision` and `TestKernelDeterminismByPrecision`
+  in the same file are parametrized over `inference_mega_precision` and produce
+  §2a. Run them with `--precision bf16,mxfp8,nvfp4` (or `--precision all`, which
+  is the same three — `fp8_fp4` is excluded because no worker venv has DeepGEMM
+  and it would only ever skip).

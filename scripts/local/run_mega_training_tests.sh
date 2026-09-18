@@ -14,6 +14,9 @@
 #   PHASES=parity ./scripts/local/run_mega_training_tests.sh
 #   PHASES=block ./scripts/local/run_mega_training_tests.sh  # whole transformer layer
 #   PHASES=update ./scripts/local/run_mega_training_tests.sh # post-update parity (RL step-2 repro)
+#   PHASES=drift ./scripts/local/run_mega_training_tests.sh  # wgrad vs the mega forward
+#   ./scripts/local/run_mega_training_tests.sh --precision nvfp4   # BI + determinism
+#   ./scripts/local/run_mega_training_tests.sh --precision all     # bf16,mxfp8,nvfp4
 #   PARITY_RUNS=10 ./scripts/local/run_mega_training_tests.sh
 #   PHASES=all ./scripts/local/run_mega_training_tests.sh   # + attribution
 #   BI=0 PHASES=parity ./scripts/local/run_mega_training_tests.sh
@@ -102,6 +105,9 @@ EP=${EP:-$GPUS}
 # A desynchronized EP collective otherwise burns the full 600 s NCCL watchdog
 # timeout before anything is reported.
 TIMEOUT=${TIMEOUT:-420}
+# Recorded before defaulting, so --precision can select the per-precision phases
+# without overriding an explicit PHASES.
+PHASES_EXPLICIT=${PHASES:+1}
 PHASES=${PHASES:-"weights parity loop gen block"}
 # The plan plus the diagnostics, which together are every test in both files.
 if [ "$PHASES" = "all" ]; then
@@ -120,8 +126,62 @@ PYTEST_ARGS=${PYTEST_ARGS:-}
 # it on first use. Set INSTALL_PYTEST=0 to fail instead of installing.
 INSTALL_PYTEST=${INSTALL_PYTEST:-1}
 
+# --precision selects which mega precisions the per-precision phases exercise.
+# Everything else stays environment-driven; this is a flag because it is the one
+# knob that changes what is being tested rather than how much of it.
+PRECISIONS=${PRECISIONS:-}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --precision|--precisions)
+            [ $# -ge 2 ] || { echo "$1 needs a value" >&2; exit 2; }
+            PRECISIONS=$2
+            shift 2
+            ;;
+        --precision=*|--precisions=*)
+            PRECISIONS=${1#*=}
+            shift
+            ;;
+        -h|--help)
+            sed -n '2,25p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "unknown argument: $1 (see --help)" >&2
+            exit 2
+            ;;
+    esac
+done
+# fp8_fp4 is included only on request: it needs DeepGEMM, which no worker venv
+# installs, so it would otherwise turn 'all' into a guaranteed skip.
+if [ "$PRECISIONS" = "all" ]; then
+    PRECISIONS="bf16,mxfp8,nvfp4"
+fi
+if [ -n "$PRECISIONS" ]; then
+    # Narrows every precision-parametrized test in whatever phases run, rather
+    # than selecting a phase. It used to force PHASES=precision, from when the
+    # determinism and batch-invariance classes were the only things parametrized
+    # over precision; parity and the generation weight tests are too now, so
+    # forcing would silently skip exactly the coverage '--precision mxfp8' reads
+    # as asking for. Use PHASES=precision for those two classes alone.
+    export MEGA_TEST_PRECISIONS=$PRECISIONS
+fi
+
 PY=$VENV/bin/python
 FORWARD=tests/unit_tests/inference/test_mega_training_forward.py
+
+free_port() {
+    # Let the kernel hand out an unused port. Racy in principle -- it is closed
+    # before torchrun binds it -- but an ephemeral port is far less likely to
+    # collide than the fixed default every other job on the node also picks.
+    "$PY" - <<'EOF'
+import socket
+
+sock = socket.socket()
+sock.bind(("", 0))
+print(sock.getsockname()[1])
+sock.close()
+EOF
+}
 
 export MEGA_TEST_EP_SIZE=$EP
 # On by default because it is the configuration that is actually bitwise, and
@@ -177,7 +237,7 @@ fi
 mkdir -p "$LOGDIR"
 status_all=0
 started=$SECONDS
-echo "========= plan: $PHASES (ranks=$GPUS, EP=$EP, BI=$MEGA_TEST_BATCH_INVARIANT) ========="
+echo "========= plan: $PHASES (ranks=$GPUS, EP=$EP, BI=$MEGA_TEST_BATCH_INVARIANT${MEGA_TEST_PRECISIONS:+, precisions=$MEGA_TEST_PRECISIONS}) ========="
 for phase in $PHASES; do
     # Each phase is a target file, a -k selector, and a launch count. Splitting
     # the forward file this way is what keeps the default plan cheap: the whole
@@ -240,10 +300,22 @@ for phase in $PHASES; do
             selector="-k 'TestParityAfterARouterUpdate'"
             launches=${UPDATE_RUNS:-3}
             ;;
+        # Batch invariance and determinism, per precision. Both gate a precision
+        # for zero-KL RL and they fail for different reasons, so both classes run.
         precision)
             ranks=$GPUS
             target=$FORWARD
-            selector="-k 'TestKernelBatchInvarianceByPrecision'"
+            selector="-k 'ByPrecision'"
+            launches=1
+            ;;
+        # How far the TE-recompute gradient sits from the true gradient of the
+        # mega forward, by finite differences on that forward. A measurement
+        # rather than a gate: the backward is TE's Jacobian by construction, so
+        # this reports the cost of that choice instead of pass/fail on it.
+        drift)
+            ranks=$GPUS
+            target=$FORWARD
+            selector="-k 'TestWgradDrift'"
             launches=1
             ;;
         ragged)
@@ -289,13 +361,19 @@ for phase in $PHASES; do
     fi
     if [ "$ranks" -eq 1 ]; then
         launcher=""
-    else
-        launcher="-m torch.distributed.run --nproc-per-node=$ranks"
     fi
     # Stale per-launch logs would otherwise be folded into the tally below.
     rm -f "$LOGDIR"/test_"${phase}".run*.log
     phase_started=$SECONDS
     for run in $(seq 1 "$launches"); do
+        # A fresh port per launch. torchrun's default 29500 is a fixed port on a
+        # shared node, so a neighbouring job -- or this script's own previous
+        # launch still in TIME_WAIT -- fails the whole phase with EADDRINUSE
+        # before a single test runs. MASTER_PORT overrides, for a fixed port.
+        if [ "$ranks" -gt 1 ]; then
+            port=${MASTER_PORT:-$(free_port)}
+            launcher="-m torch.distributed.run --nproc-per-node=$ranks --master-port=$port"
+        fi
         if [ "$launches" -eq 1 ]; then
             log=$LOGDIR/test_${phase}.log
             echo "========= $phase (ranks=$ranks) -> $log ========="

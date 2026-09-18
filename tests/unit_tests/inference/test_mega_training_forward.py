@@ -54,7 +54,7 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.inference.moe.mega._deps import _HAVE_FLASHINFER_MOE_EP
-from megatron.core.inference.moe.mega.training_weights import MegaTrainingWeightScratch
+from megatron.core.inference.moe.mega.training_weights import reset_training_scratches
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -173,6 +173,57 @@ def _config(mega_training: bool, **overrides):
     return TransformerConfig(**base)
 
 
+def _requested_precisions():
+    """The precisions ``--precision`` asked for, defaulting to the cheap pair.
+
+    One parse, shared by every precision-parametrized class in this file, so the
+    flag cannot come to mean different things in different places.
+    """
+    requested = os.environ.get("MEGA_TEST_PRECISIONS", "bf16,mxfp8")
+    return tuple(p for p in requested.split(",") if p)
+
+
+# The precisions whose kernel weights we build and own, so they can be refit and
+# can drive the training forward. Must track
+# experts._MEGA_CALLER_OWNED_PRECISIONS: a precision added there without being
+# added here goes untested, and one added here without the support behind it
+# fails in the adapter.
+_CALLER_OWNED_PRECISIONS = ("bf16", "mxfp8")
+
+# Narrowed by --precision, sharing MEGA_TEST_PRECISIONS with the determinism and
+# batch-invariance classes below so one flag means one thing. Filtered rather
+# than taken as given: those classes accept any precision the kernel supports,
+# and asking for nvfp4 there should not turn these into failures for a precision
+# that has no packer.
+_OWNED_PRECISIONS = tuple(
+    p for p in _requested_precisions() if p in _CALLER_OWNED_PRECISIONS
+) or (
+    # Skipped rather than silently falling back to the full set, which would run
+    # something other than what was asked for and report it as a pass.
+    pytest.param(
+        _CALLER_OWNED_PRECISIONS[0],
+        marks=pytest.mark.skip(reason="--precision named no precision with a weight packer"),
+    ),
+)
+
+
+def _parity_configs(precision):
+    """``(generation, training)`` configs that differ only in the kernel used.
+
+    A quantized training forward takes the gradient from the bf16 recompute, so
+    it needs the straight-through opt-in. The generation config must not set it:
+    it only relaxes a training restriction, and the config rejects it standing
+    alone rather than ignoring it.
+    """
+    generation = _config(mega_training=False, inference_mega_precision=precision)
+    training = _config(
+        mega_training=True,
+        inference_mega_precision=precision,
+        moe_mega_training_straight_through=precision != "bf16",
+    )
+    return generation, training
+
+
 def _build_layer(config, for_inference: bool = False):
     """Build the MoE layer.
 
@@ -211,9 +262,9 @@ def _bump_expert_weights(layer, delta=0.01):
 def _use_flashinfer_preprocessing(layer):
     """Put one generation layer back on FlashInfer's own weight preprocessing.
 
-    bf16 generation owns its transformed weights so that a refit can rewrite
-    them, which leaves no in-tree way to reach the path FlashInfer takes when it
-    preprocesses and snapshots the weights itself. Rebuilding the adapter is
+    bf16 and mxfp8 generation own their transformed weights so that a refit can
+    rewrite them, which leaves no in-tree way to reach the path FlashInfer takes
+    when it preprocesses and snapshots the weights itself. Rebuilding the adapter is
     enough to get it back: each one builds its FlashInfer layer lazily, so this
     is still a layer that has never been handed a weight.
     """
@@ -377,7 +428,7 @@ def _parallel_state():
     # Registers the 'expert-parallel-rng' tracker state that expert weight init
     # requires. Utils.initialize_model_parallel does not do this.
     model_parallel_cuda_manual_seed(123)
-    MegaTrainingWeightScratch.reset()
+    reset_training_scratches()
     # Both are process-wide; leaking them would let one test's inference setup
     # mask a missing allocation in the next.
     InferenceAllGatherDispatcherBase._valid_tokens_tensor = None
@@ -386,7 +437,7 @@ def _parallel_state():
     # quietly misbehaving -- but it would raise in the wrong test.
     MegatronMegaMoEAdapter.reset_shared_training()
     yield
-    MegaTrainingWeightScratch.reset()
+    reset_training_scratches()
     InferenceAllGatherDispatcherBase._valid_tokens_tensor = None
     MegatronMegaMoEAdapter.reset_shared_training()
     if BATCH_INVARIANT:
@@ -460,9 +511,16 @@ class TestTrainGenParity:
     # routing would produce.
     COLD_TOL = 5e-3
 
-    def test_training_forward_matches_generation_forward(self):
-        config = _config(mega_training=True)
-        gen_layer = _build_layer(_config(mega_training=False), for_inference=True).eval()
+    @pytest.mark.parametrize("precision", _OWNED_PRECISIONS)
+    def test_training_forward_matches_generation_forward(self, precision):
+        """The claim the whole hybrid rests on, at every precision it supports.
+
+        For mxfp8 this is also the only thing that makes the straight-through
+        trade worth taking: the gradient is knowingly bf16, so the forward has to
+        be bitwise identical to generation or there is nothing bought in return.
+        """
+        gen_config, config = _parity_configs(precision)
+        gen_layer = _build_layer(gen_config, for_inference=True).eval()
         train_layer = _build_layer(config).train()
         _copy_expert_weights(gen_layer, train_layer)
 
@@ -812,17 +870,22 @@ class TestGenerationWeightOwnership:
     kernel, and that one layer's repack cannot be served to another.
     """
 
-    def test_caller_owned_weights_match_flashinfer_preprocessing(self):
+    @pytest.mark.parametrize("precision", _OWNED_PRECISIONS)
+    def test_caller_owned_weights_match_flashinfer_preprocessing(self, precision):
         """The repack is equivalent to the path it replaced, end to end.
 
         ``test_mega_training_weights.py`` already pins the packed bytes against
-        FlashInfer's own ``_interleave_gate_up_32``. This is the other half:
-        that handing those bytes over as ``transformed_weights`` with
-        ``preprocess_weights=False`` produces the same forward as letting
-        FlashInfer build the pack itself, so the adapter wiring is right and not
-        just the layout.
+        FlashInfer's own ``_interleave_gate_up_32``, and for mxfp8 against its
+        quantizer. This is the other half: that handing those bytes over as
+        ``transformed_weights`` with ``preprocess_weights=False`` produces the
+        same forward as letting FlashInfer build the pack itself, so the adapter
+        wiring is right and not just the layout.
+
+        mxfp8 matters more here than bf16 does. Its scales travel in a second
+        tensor that bf16 leaves as ``None``, so this is the only place that
+        checks the scale planes reach the kernel rather than merely being built.
         """
-        config = _config(mega_training=False)
+        config = _config(mega_training=False, inference_mega_precision=precision)
         owned = _build_layer(config, for_inference=True).eval()
         preprocessed = _build_layer(config, for_inference=True).eval()
         _copy_expert_weights(owned, preprocessed)
@@ -883,15 +946,22 @@ class TestGenerationWeightOwnership:
             "returns the pre-refit output"
         )
 
-    def test_refresh_after_a_refit_matches_a_freshly_built_layer(self):
+    @pytest.mark.parametrize("precision", _OWNED_PRECISIONS)
+    def test_refresh_after_a_refit_matches_a_freshly_built_layer(self, precision):
         """The refreshed weights are right, not merely different.
 
         A refit is only correct if the refitted layer becomes
         indistinguishable from a layer that had the new weights all along, which
         is the reference here. Bitwise, since both sides pack the same bytes and
         run the same kernel.
+
+        For mxfp8 the refresh requantizes rather than copies, so this is also
+        what catches a requantization that writes somewhere the kernel is not
+        reading -- the buffers are allocated by the first repack and only
+        rewritten after, and getting that backwards would leave the kernel bound
+        to a tensor nothing updates.
         """
-        config = _config(mega_training=False)
+        config = _config(mega_training=False, inference_mega_precision=precision)
         refitted = _build_layer(config, for_inference=True).eval()
         hidden = _hidden(config, seed=6)
 
@@ -970,22 +1040,23 @@ class TestGenerationWeightOwnership:
             "they are sharing a weight buffer"
         )
 
-    def test_refresh_refuses_a_quantized_precision(self):
-        """The quantized precisions cannot be refit, and say so rather than drifting.
+    def test_refresh_refuses_an_unowned_precision(self):
+        """A precision we do not quantize ourselves refuses rather than drifting.
 
-        FlashInfer quantizes while it preprocesses; the repack only reshapes, so
-        there is no way to rebuild an mxfp8 or nvfp4 kernel weight from the bf16
-        parameters. Refusing is the point -- the alternative is generation
-        quietly continuing on the weights snapshotted before the refit. See
+        mxfp8 is refittable because we call FlashInfer's quantizer and own the
+        result. nvfp4 and fp8_fp4 still let FlashInfer preprocess and snapshot,
+        so there is no buffer of ours to rewrite, and refusing is the point --
+        the alternative is generation quietly continuing on the weights
+        snapshotted before the refit. See
         ``megatron/core/inference/moe/mega/QUANTIZED_BLOCKERS.md``.
         """
         config = _config(mega_training=False)
         layer = _build_layer(config)
         # The precision is read at refresh time rather than captured at
         # construction, so flipping it here reaches the guard without needing
-        # quantized parameters -- which is convenient, since this refusal is
-        # itself why no quantized RL path exists to build them.
-        layer.experts.config.inference_mega_precision = "mxfp8"
+        # nvfp4 parameters -- which is convenient, since this refusal is itself
+        # why no nvfp4 RL path exists to build them.
+        layer.experts.config.inference_mega_precision = "nvfp4"
 
         with pytest.raises(NotImplementedError, match="quantizes the weights"):
             layer.experts.refresh_mega_weights()
@@ -1054,6 +1125,230 @@ class TestAgainstStandardBf16:
             "mega vs TE bf16 wgrad",
         )
         assert wgrad_error < self.GRAD_TOL, f"wgrad diverges: rel_rms={wgrad_error:.3e}"
+
+
+class TestWgradDrift:
+    """How far the hybrid's wgrad sits from the true gradient of the mega forward.
+
+    Not one of the five acceptance properties: a measurement, reported so the
+    cost of the design is a number rather than an argument.
+
+    The hybrid takes its forward value from the megakernel and its backward from
+    a TE recompute, so the gradient it produces is TE's Jacobian at the same
+    input, not mega's. Nothing else here measures that gap.
+    ``test_input_and_weight_gradients_match_te_bf16`` compares the hybrid against
+    pure TE, and both sides of that comparison take their backward from TE at the
+    same point, so it reads near zero by construction and checks the plumbing
+    rather than the arithmetic. Mega has no backward to compare against, which is
+    why the gap has been quoted from the forward error instead of measured.
+
+    Finite differences on the mega forward close that hole. For a fixed cotangent
+    ``g`` take ``L(W) = <g, y_mega(W)>``; its directional derivative along a unit
+    direction ``V`` is ``(L(W + eV) - L(W - eV)) / 2e``, compared against
+    ``<wgrad, V>``. A random direction rather than a single coordinate: one bf16
+    element drowns in rounding, while a projection aggregates signal across the
+    tensor without raising the noise, since both scale together under it.
+
+    fc2 is the primary measurement because ``y`` is *linear* in the fc2 weights --
+    the activations and the routing probabilities do not depend on them -- so the
+    difference quotient carries no truncation error at any step size and the step
+    can sit far above bf16's ~4e-3 relative resolution. fc1 is behind the SwiGLU
+    and nonlinear, so its step has to be small enough that curvature stays
+    negligible and large enough to clear rounding; it is reported at two steps so
+    the estimate can be judged for stability instead of taken on faith.
+
+    Every measurement is paired with the same estimate against a *pure TE* layer,
+    which is the noise floor of the method: there the analytic gradient is the
+    gradient of the very function being differenced, so any drift it reports is
+    finite-difference error alone. The mega number is evidence of real drift only
+    to the extent that it exceeds that control, which is what the assertion
+    compares it against.
+    """
+
+    # A gradient taken through the wrong expert, a dropped routing probability, or
+    # a dispatcher that does not match the value pass moves a directional
+    # derivative by O(1). That is what this catches; everything smaller is
+    # reported and tolerated, since whether 5e-3 is acceptable is a modelling
+    # question and not a unit test's to settle.
+    DRIFT_BOUND = 0.5
+    # Above this multiple of the control the drift is the kernels disagreeing
+    # rather than the difference quotient being noisy.
+    CONTROL_SLACK = 4.0
+
+    # Steps as a fraction of the parameter norm. fc2 is linear in W, so the large
+    # step costs no accuracy and buys ~60x headroom over bf16 rounding. fc1 has to
+    # trade: the smaller step is quieter about curvature, the larger about rounding.
+    FC2_STEP = 0.25
+    FC1_STEPS = (0.02, 0.06)
+
+    NUM_DIRECTIONS = 3
+
+    @staticmethod
+    def _worst(value, label):
+        """Worst value across ranks, in the same reporting convention as ``_measure``.
+
+        Collective: every rank must reach it, which holds because these tests take
+        the same path on all ranks.
+        """
+        tensor = torch.tensor([value], device="cuda")
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MAX)
+        worst = tensor.item()
+        if torch.distributed.get_rank() == 0:
+            print(f"[mega-metric] {label}: {worst:.3e}", flush=True)
+        return worst
+
+    @staticmethod
+    def _cotangent(shape, seed):
+        return torch.randn(
+            shape,
+            device="cuda",
+            dtype=torch.float32,
+            generator=torch.Generator(device="cuda").manual_seed(seed),
+        )
+
+    @staticmethod
+    def _directions(param, count, seed):
+        """Unit-norm random directions in the parameter's space."""
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        directions = []
+        for _ in range(count):
+            raw = torch.randn(
+                param.shape, device="cuda", dtype=torch.float32, generator=generator
+            )
+            directions.append(raw / raw.norm())
+        return directions
+
+    @staticmethod
+    def _loss(layer, hidden, cotangent):
+        """``<cotangent, layer(hidden)>``, reduced in fp32.
+
+        Under ``no_grad`` the layer runs its value pass only, which is the mega
+        forward being differenced -- the recompute never fires without a backward.
+        """
+        with torch.no_grad():
+            out, _ = layer(hidden)
+        return (out.float() * cotangent).sum().item()
+
+    @classmethod
+    def _empirical(cls, layer, hidden, cotangent, param, direction, step):
+        """Central difference of the loss along ``direction``, as a derivative.
+
+        The repack reads the live parameters on every forward, so writing to
+        ``param`` here is what makes the kernel see the perturbation.
+        """
+        with torch.no_grad():
+            original = param.detach().float().clone()
+            eps = step * original.norm().item()
+            assert eps > 0, "cannot difference a zero-norm parameter"
+            try:
+                param.copy_(original + eps * direction)
+                plus = cls._loss(layer, hidden, cotangent)
+                param.copy_(original - eps * direction)
+                minus = cls._loss(layer, hidden, cotangent)
+            finally:
+                param.copy_(original)
+        return (plus - minus) / (2.0 * eps)
+
+    @staticmethod
+    def _analytic_grad(layer, hidden, cotangent, param):
+        """``dL/dW`` from one real forward and backward, which is TE's Jacobian."""
+        layer.zero_grad(set_to_none=True)
+        out, _ = layer(hidden)
+        (out.float() * cotangent).sum().backward()
+        assert param.grad is not None, "no gradient reached the parameter"
+        return param.grad.detach().float().clone()
+
+    @classmethod
+    def _drift(cls, layer, hidden, cotangent, param, directions, step):
+        """Worst relative disagreement between the analytic and differenced slopes."""
+        grad = cls._analytic_grad(layer, hidden, cotangent, param)
+        worst = 0.0
+        for direction in directions:
+            analytic = (grad * direction).sum().item()
+            empirical = cls._empirical(layer, hidden, cotangent, param, direction, step)
+            # Scale-free against the differenced slope, which is the estimate of
+            # the true one. Guarded because a direction can be near-orthogonal to
+            # the gradient and make both sides tiny.
+            denom = max(abs(empirical), 1e-6)
+            worst = max(worst, abs(analytic - empirical) / denom)
+        return worst
+
+    def _build_pair(self):
+        """A hybrid layer and a pure-TE layer with identical weights."""
+        te_layer = _build_layer(_config(mega_training=False)).train()
+        mega_layer = _build_layer(_config(mega_training=True)).train()
+        _copy_expert_weights(te_layer, mega_layer)
+        return te_layer, mega_layer
+
+    def test_fc2_wgrad_drift(self):
+        """The clean measurement: ``y`` is linear in fc2, so the step size is free."""
+        te_layer, mega_layer = self._build_pair()
+        hidden = _hidden(_config(mega_training=True), seed=11).requires_grad_(True)
+        cotangent = self._cotangent((hidden.shape[0], 1, hidden.shape[2]), seed=12)
+        directions = self._directions(mega_layer.experts.linear_fc2.weight0, 3, seed=13)
+
+        control = self._drift(
+            te_layer,
+            hidden,
+            cotangent,
+            te_layer.experts.linear_fc2.weight0,
+            directions,
+            self.FC2_STEP,
+        )
+        drift = self._drift(
+            mega_layer,
+            hidden,
+            cotangent,
+            mega_layer.experts.linear_fc2.weight0,
+            directions,
+            self.FC2_STEP,
+        )
+        control = self._worst(control, "fc2 wgrad drift, TE control (method noise)")
+        drift = self._worst(drift, "fc2 wgrad drift vs the mega forward")
+
+        assert drift <= max(self.DRIFT_BOUND, self.CONTROL_SLACK * control), (
+            f"the wgrad has come unhooked from the mega forward: drift={drift:.3e} "
+            f"against a method noise floor of {control:.3e}"
+        )
+
+    def test_fc1_wgrad_drift(self):
+        """Behind the SwiGLU, so reported at two steps rather than trusted at one."""
+        te_layer, mega_layer = self._build_pair()
+        hidden = _hidden(_config(mega_training=True), seed=14).requires_grad_(True)
+        cotangent = self._cotangent((hidden.shape[0], 1, hidden.shape[2]), seed=15)
+        directions = self._directions(mega_layer.experts.linear_fc1.weight0, 3, seed=16)
+
+        drifts = {}
+        for step in self.FC1_STEPS:
+            control = self._drift(
+                te_layer,
+                hidden,
+                cotangent,
+                te_layer.experts.linear_fc1.weight0,
+                directions,
+                step,
+            )
+            drift = self._drift(
+                mega_layer,
+                hidden,
+                cotangent,
+                mega_layer.experts.linear_fc1.weight0,
+                directions,
+                step,
+            )
+            label = f"fc1 wgrad drift at step={step:g}"
+            drifts[step] = (
+                self._worst(drift, f"{label} vs the mega forward"),
+                self._worst(control, f"{label}, TE control (method noise)"),
+            )
+
+        # The larger step has the better signal-to-rounding ratio, so it is the one
+        # worth asserting on; the smaller is reported for the stability read.
+        drift, control = drifts[max(self.FC1_STEPS)]
+        assert drift <= max(self.DRIFT_BOUND, self.CONTROL_SLACK * control), (
+            f"the wgrad has come unhooked from the mega forward: drift={drift:.3e} "
+            f"against a method noise floor of {control:.3e}"
+        )
 
 
 class TestWholeTransformerLayer:
@@ -1897,9 +2192,91 @@ class TestRaggedExpertOccupancy:
         )
 
 
-_MEGA_PRECISIONS = tuple(
-    p for p in os.environ.get("MEGA_TEST_PRECISIONS", "bf16,mxfp8").split(",") if p
-)
+_MEGA_PRECISIONS = _requested_precisions()
+
+
+class TestKernelDeterminismByPrecision:
+    """(11) Does a precision return the same bits when the same launch is repeated?
+
+    Determinism and batch invariance are different properties and zero-KL RL needs
+    both. ``TestKernelBatchInvarianceByPrecision`` varies the launch width and asks
+    whether a token's bits survive the change. This holds everything fixed --
+    same layer, same weights, same routing, same token count -- and simply launches
+    again.
+
+    Worth separating because they fail for different reasons and the remedies
+    differ. A width-dependent result is a tiling or reduction-order property, which
+    is what canonical expert ordering addressed for bf16. A launch-dependent result
+    at fixed width is atomics, a nondeterministic split-K, or workspace state
+    carried across launches, and it would rule a precision out for RL outright:
+    the rollout could not be reproduced even by re-running it unchanged, so no
+    amount of train/generation agreement would make the ratio meaningful.
+
+    Generation against generation, and only the router is ever perturbed, for the
+    same reason as the sibling class: the quantized precisions snapshot and
+    quantize their weights at construction, so the experts have to stay put.
+    """
+
+    EXPERTS = int(os.environ.get("MEGA_TEST_PROD_EXPERTS", "128"))
+    TOKENS = int(os.environ.get("MEGA_TEST_RAGGED_TOKENS", "1024"))
+    RELAUNCHES = int(os.environ.get("MEGA_TEST_RELAUNCHES", "8"))
+
+    @pytest.mark.parametrize("precision", _MEGA_PRECISIONS)
+    def test_repeated_launches_return_identical_bits(self, precision):
+        if self.EXPERTS % EP_SIZE:
+            pytest.skip(f"{self.EXPERTS} experts do not divide EP={EP_SIZE}")
+
+        overrides = dict(
+            num_moe_experts=self.EXPERTS,
+            inference_mega_max_tokens_per_rank=self.TOKENS,
+            inference_mega_precision=precision,
+        )
+        if precision != "bf16":
+            # Megatron's fused quantize kernels cover squared-relu only; this spec
+            # is SwiGLU, and the mega path quantizes inside FlashInfer regardless.
+            overrides["inference_moe_disable_fused_quant_kernels"] = True
+
+        try:
+            gen = _build_layer(_config(mega_training=False, **overrides), for_inference=True)
+        except (ValueError, NotImplementedError, ImportError) as error:
+            pytest.skip(f"{precision} unavailable in this build: {error}")
+
+        hidden = _hidden(gen.config, seed=900, tokens=self.TOKENS)
+
+        differed = 0
+        worst = 0.0
+        with torch.no_grad(), InferenceMode.active():
+            first, _ = gen(hidden)
+            # Cloned because a megakernel output can be a borrowed view on the
+            # pooled workspace, which the next launch is free to overwrite. Holding
+            # the view would compare a launch against itself.
+            reference = first.clone()
+            for _ in range(self.RELAUNCHES):
+                again, _ = gen(hidden)
+                if not torch.equal(again, reference):
+                    differed += 1
+                    worst = max(worst, _rel_rms(again, reference))
+
+        stats = torch.tensor([float(differed), worst], device="cuda")
+        torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.MAX)
+        differed, worst = int(stats[0].item()), stats[1].item()
+
+        if torch.distributed.get_rank() == 0:
+            verdict = "NOT deterministic" if differed else "deterministic"
+            print(
+                f"[mega-metric] {precision} over {self.RELAUNCHES} relaunches: "
+                f"{differed} differ -> {verdict}",
+                flush=True,
+            )
+
+        assert differed == 0, (
+            f"the {precision} megakernel is not deterministic: {differed} of "
+            f"{self.RELAUNCHES} identical relaunches returned different bits "
+            f"(worst rel_rms={worst:.3e}). Nothing changed between them -- same "
+            f"weights, same routing, same token count -- so this is the kernel, and "
+            f"it rules the precision out for zero-KL RL: a rollout that cannot be "
+            f"reproduced by re-running it has no reference for the ratio."
+        )
 
 
 class TestKernelBatchInvarianceByPrecision:

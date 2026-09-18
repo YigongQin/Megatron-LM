@@ -8,7 +8,9 @@ import torch.nn.functional as F
 
 from megatron.core.inference.moe.mega.training_weights import (
     MegaTrainingWeightScratch,
+    reset_training_scratches,
     kernel_layout_from_parameters,
+    mxfp8_kernel_weights_from_views,
 )
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -84,9 +86,9 @@ def _weights(num_experts, hidden, intermediate, dtype=torch.bfloat16):
 
 @pytest.fixture(autouse=True)
 def _reset_scratch():
-    MegaTrainingWeightScratch.reset()
+    reset_training_scratches()
     yield
-    MegaTrainingWeightScratch.reset()
+    reset_training_scratches()
 
 
 @pytest.mark.internal
@@ -181,6 +183,103 @@ class TestMegaTrainingWeightScratch:
             kernel_layout_from_parameters(config, fc1, fc2[:3], owner=1)
 
 
+def _mxfp8_weights_module():
+    """FlashInfer's mxfp8 mega weight module, or skip."""
+    return pytest.importorskip(
+        "flashinfer.moe_ep.backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.weights"
+    )
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="MXFP8 quantization is a device kernel")
+class TestMxfp8KernelWeights:
+    """Whether we can produce the quantized bytes FlashInfer would have produced.
+
+    Refit is what forces the question. Generation owns the kernel's weight
+    buffers so that a refit can rewrite them in place, which means our code --
+    not ``preprocess_mega_weights`` -- decides the quantized bytes the kernel
+    reads. Anything short of byte-equality makes the owned path a slightly
+    different model from the preprocessed one, indistinguishable from a real
+    train/generation gap, so these compare bytes rather than tolerances.
+    """
+
+    EXPERTS = 4
+
+    def _quantized(self, config):
+        """Our kernel-ready MXFP8 weights, and the bf16 weights they came from."""
+        fc1, fc2 = _weights(self.EXPERTS, config.hidden_size, config.moe_ffn_hidden_size)
+        fc1 = [w.cuda() for w in fc1]
+        fc2 = [w.cuda() for w in fc2]
+        views = kernel_layout_from_parameters(config, fc1, fc2, owner=1)
+        return mxfp8_kernel_weights_from_views(*views), (fc1, fc2)
+
+    @staticmethod
+    def _reference(config, fc1, fc2):
+        """The same weights through FlashInfer's own preprocessing."""
+        from flashinfer.moe_ep.weights import MoEWeightPack
+
+        pack = MoEWeightPack(w13=torch.stack(fc1), w2=torch.stack(fc2))
+        return _mxfp8_weights_module().preprocess_mega_weights(
+            pack,
+            intermediate_size=config.moe_ffn_hidden_size,
+            hidden_size=config.hidden_size,
+        )
+
+    def test_matches_flashinfer_preprocessing(self):
+        _mxfp8_weights_module()
+        config = _config()
+        got, (fc1, fc2) = self._quantized(config)
+        want = self._reference(config, fc1, fc2)
+
+        for label, mine, theirs in zip(("fc1", "fc2"), got, want):
+            for name, ours, upstream in (
+                ("data", mine[0], theirs[0]),
+                ("scale", mine[1], theirs[1]),
+            ):
+                assert ours.shape == upstream.shape, (
+                    f"{label} {name}: {tuple(ours.shape)} != {tuple(upstream.shape)}"
+                )
+                assert ours.dtype == upstream.dtype, f"{label} {name} dtype"
+                # Compared as bytes: torch.equal has no fp8 kernel, and bytes are
+                # the only thing the kernel actually reads.
+                mismatched = (ours.view(torch.uint8) != upstream.view(torch.uint8)).sum()
+                assert mismatched == 0, (
+                    f"{label} {name}: {int(mismatched)} of {ours.numel()} bytes differ "
+                    "from FlashInfer's preprocessing"
+                )
+
+    def test_upstream_validator_accepts_our_weights(self):
+        """The kernel's own admission check for ``preprocess_weights=False``."""
+        validate = _mxfp8_weights_module().validate_transformed_mega_weights
+        config = _config()
+        got, _ = self._quantized(config)
+        validate(
+            got,
+            intermediate_size=config.moe_ffn_hidden_size,
+            hidden_size=config.hidden_size,
+            world_size=1,
+            num_experts=self.EXPERTS,
+        )
+
+    def test_quantization_follows_parameter_updates(self):
+        """A refit that changed nothing in the quantized bytes would be invisible."""
+        _mxfp8_weights_module()
+        config = _config()
+        got, (fc1, fc2) = self._quantized(config)
+        before = got[0][0].view(torch.uint8).clone()
+
+        for w in fc1:
+            w.add_(1.0)
+        views = kernel_layout_from_parameters(config, fc1, fc2, owner=1)
+        after = mxfp8_kernel_weights_from_views(*views)
+
+        assert not torch.equal(after[0][0].view(torch.uint8), before)
+        want = self._reference(config, fc1, fc2)
+        assert torch.equal(
+            after[0][0].view(torch.uint8), want[0][0].view(torch.uint8)
+        ), "requantization diverged from FlashInfer after a parameter update"
+
+
 @pytest.mark.internal
 class TestMegaTrainingForwardConfig:
     def test_accepts_valid_config(self):
@@ -200,6 +299,29 @@ class TestMegaTrainingForwardConfig:
     def test_requires_bf16_precision(self):
         with pytest.raises(ValueError, match="straight-through estimator"):
             _config(moe_mega_training_forward=True, inference_mega_precision="nvfp4")
+
+    def test_straight_through_admits_mxfp8(self):
+        """The opt-in exists so the gradient trade is stated, not to be a gate."""
+        config = _config(
+            moe_mega_training_forward=True,
+            inference_mega_precision="mxfp8",
+            moe_mega_training_straight_through=True,
+        )
+        assert config.moe_mega_training_straight_through
+
+    def test_straight_through_still_rejects_a_precision_without_a_packer(self):
+        """nvfp4 cannot rebuild its kernel weights, so the opt-in cannot save it."""
+        with pytest.raises(ValueError, match="only bf16 and mxfp8 can be rebuilt"):
+            _config(
+                moe_mega_training_forward=True,
+                inference_mega_precision="nvfp4",
+                moe_mega_training_straight_through=True,
+            )
+
+    def test_straight_through_alone_is_rejected(self):
+        """Ignoring it would read as having opted into something that is not running."""
+        with pytest.raises(ValueError, match="only relaxes a restriction"):
+            _config(moe_mega_training_straight_through=True)
 
     def test_requires_moe_recompute(self):
         with pytest.raises(ValueError, match="must come from a recompute pass"):
