@@ -392,23 +392,42 @@ def mxfp8_kernel_weights_from_views(
 
     quantized = []
     for view in (fc1, fc2):
-        num_local_experts = view.shape[0]
-        data_parts = []
-        scale_parts = []
-        for expert in range(num_local_experts):
-            # The quantizer wants the reduction dimension trailing, which is the
-            # transpose of the kernel view. That is the orientation FlashInfer
-            # quantizes in, so the 32-element block boundaries land on the same
-            # elements; quantizing the kernel view directly would block along the
-            # output dimension instead and silently disagree.
-            data, scale = mxfp8_quantize_per_block_32(
-                view[expert].transpose(0, 1).float(), torch.float8_e4m3fn
-            )
-            data_parts.append(data.transpose(0, 1))
-            scale_parts.append(to_blocked(scale))
-        # Stacked through a uint8 view: torch.stack has no kernel for fp8, and
-        # this is the helper FlashInfer stacks its own transformed weights with.
-        stacked_data = _stack_byte_reinterpretable_tensors(data_parts, dim=0)
+        num_local_experts, k_size, n_size = view.shape
+        # The quantizer wants the reduction dimension trailing, which is the
+        # transpose of the kernel view. That is the orientation FlashInfer
+        # quantizes in, so the 32-element block boundaries land on the same
+        # elements; quantizing the kernel view directly would block along the
+        # output dimension instead and silently disagree.
+        #
+        # Every expert's rows go in one call rather than one call per expert.
+        # The quantizer reduces within a single row's 32-element block and is
+        # elementwise everywhere else, so rows from different experts cannot
+        # influence each other and stacking them first is bit-identical -- which
+        # the byte-equality test against preprocess_mega_weights pins. It is
+        # worth the care: per expert this ran a ~14-op eager chain 32 times per
+        # matrix per layer, which measured 21 ms of a 22 ms repack at ~13 GB/s,
+        # i.e. bound by launch count rather than by bandwidth.
+        rows = view.transpose(1, 2).reshape(num_local_experts * n_size, k_size).float()
+        data, scale = mxfp8_quantize_per_block_32(rows, torch.float8_e4m3fn)
+        # Back to the per-expert kernel layout the stack used to produce, through
+        # a uint8 view because not every build has a copy kernel for every fp8
+        # dtype -- the same reason FlashInfer stacks its own weights that way.
+        stacked_data = (
+            data.view(torch.uint8)
+            .reshape(num_local_experts, n_size, k_size)
+            .transpose(1, 2)
+            .contiguous()
+            .view(data.dtype)
+        )
+        # to_blocked stays per expert. It pads its row count up to a swizzle
+        # block and rearranges within that block, so batching the experts would
+        # let one expert's rows land in another's block unless the row count
+        # happened to be block-aligned. It also reads 1/32 of the bytes the
+        # quantizer does, so the loop that matters is the one above.
+        scale_parts = [
+            to_blocked(expert_scale)
+            for expert_scale in scale.reshape(num_local_experts, n_size, -1)
+        ]
         stacked_scale = _stack_byte_reinterpretable_tensors(scale_parts, dim=0)
         quantized.append(
             (stacked_data, stacked_scale.view(num_local_experts, scale_parts[0].numel()))
