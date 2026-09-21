@@ -255,12 +255,16 @@ class MoELayer(BaseMoELayer):
             config.recompute_granularity == 'selective'
             and "shared_experts" in config.recompute_modules
         )
-        # Train/generation parity mode: the mega kernel produces the layer output
-        # and the recompute pass produces the backward graph, so the two passes of
-        # the same checkpointed forward run different expert implementations and
-        # different token dispatchers. True only during the output-producing pass.
-        self.mega_training_forward = config.moe_mega_training_forward
-        self._mega_pass_is_value = False
+        # Train/generation parity mode: the inference expert kernel produces the
+        # layer output and the recompute pass produces the backward graph, so the
+        # two passes of the same checkpointed forward run different expert
+        # implementations and different token dispatchers. Which inference kernel
+        # is inference_grouped_gemm_backend's choice; nothing here depends on it.
+        # Backend-agnostic: mega is one case. config.moe_mega_training_forward
+        # resolves into moe_inference_training_forward in __post_init__, so
+        # reading the general flag here covers both spellings.
+        self.inference_training_forward = config.moe_inference_training_forward
+        self._inference_pass_is_value = False
 
         self.tp_group = pg_collection.tp
 
@@ -454,6 +458,33 @@ class MoELayer(BaseMoELayer):
             config=self.config,
             pg_collection=pg_collection,
         )
+
+        # The dispatcher for the value pass of a parity-mode training forward.
+        #
+        # Usually the inference one, since the point is to run what generation
+        # runs. NVLS is the exception: it moves tokens through a symmetric heap
+        # that the inference context allocates, which does not exist in a
+        # training step, so the value pass falls back to the NCCL all-gather
+        # that produces the same layout over ordinary collectives.
+        #
+        # That fallback is the one place this construction is not equal to
+        # generation by construction, and it is deliberately not hidden: the two
+        # reduce across EP ranks through different collectives, so if their
+        # reduction orders disagree the combine is where parity breaks. The
+        # bitwise train-vs-generation test is what decides whether that matters
+        # in practice; batch_invariant_collective exists to make it not.
+        self._parity_needs_nccl_fallback = (
+            self.config.moe_inference_training_forward and dispatcher_type == 'nvls'
+        )
+        if self._parity_needs_nccl_fallback:
+            self._parity_token_dispatcher = NCCLAllGatherDispatcher(
+                self.num_local_experts,
+                self.local_expert_indices,
+                config=self.config,
+                pg_collection=pg_collection,
+            )
+        else:
+            self._parity_token_dispatcher = self._inference_token_dispatcher
 
         # Wire shared-expert overlap into the inference dispatcher (NVLS only).
         # The dispatcher launches the shared-expert forward on SharedExpertMLP.stream
@@ -709,22 +740,35 @@ class MoELayer(BaseMoELayer):
 
         # MoE forward: route -> dispatch -> compute -> combine
         def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
-            if self._mega_forward_applies():
-                # The mega kernel consumes undispatched local tokens and does its
-                # own EP transport, so the value pass bypasses dispatch/combine
-                # while the recompute pass needs the real ones to build wgrad.
-                use_mega = self._mega_pass_is_value
+            if self._inference_forward_applies():
+                # The value pass runs generation's dispatcher, the recompute pass
+                # training's, because the recompute is what has to build wgrad
+                # through the ordinary path. What generation's dispatcher does
+                # differs by backend: mega bypasses dispatch/combine entirely
+                # because its kernel owns EP transport, while the vLLM kernel
+                # wants every token on every rank and leaves the cross-rank
+                # reduction to the dispatcher's combine.
+                use_inference = self._inference_pass_is_value
+                if use_inference:
+                    # The all-gather dispatchers read a per-step valid-tokens
+                    # scalar that the inference context normally allocates. In a
+                    # training step nothing has, and the vLLM kernel does read
+                    # it (unlike mega, which takes the routing map directly), so
+                    # allocate it once here rather than leaving the kernel to
+                    # find an uninitialised buffer.
+                    if NCCLAllGatherDispatcher._valid_tokens_tensor is None:
+                        NCCLAllGatherDispatcher.allocate_buffers()
                 self.token_dispatcher = (
-                    self._inference_token_dispatcher
-                    if use_mega
+                    self._parity_token_dispatcher
+                    if use_inference
                     else self._training_token_dispatcher
                 )
                 self.shared_expert_overlap = (
-                    False if use_mega else self.config.moe_shared_expert_overlap
+                    False if use_inference else self.config.moe_shared_expert_overlap
                 )
-                self.experts._in_mega_recompute = not use_mega
+                self.experts._in_inference_recompute = not use_inference
                 # Consumed: any later invocation of this closure is a recompute.
-                self._mega_pass_is_value = False
+                self._inference_pass_is_value = False
             try:
                 if "route" in self.fwd_execution_map:
                     shared_expert_output = self.shared_experts_compute(hidden_states)
@@ -770,7 +814,7 @@ class MoELayer(BaseMoELayer):
         # Mark the next custom_forward invocation as the output-producing pass.
         # custom_forward clears this, so the recompute triggered from backward
         # takes the TE path.
-        self._mega_pass_is_value = self._mega_forward_applies()
+        self._inference_pass_is_value = self._inference_forward_applies()
 
         if self.moe_layer_recompute and self.training:
             if self.config.fp8 or self.config.fp4:
@@ -792,7 +836,7 @@ class MoELayer(BaseMoELayer):
 
         return outputs
 
-    def _mega_forward_applies(self) -> bool:
+    def _inference_forward_applies(self) -> bool:
         """Whether this module's forward should route expert compute through mega.
 
         Deliberately not conditioned on ``self.training``. The pass that has to
@@ -808,7 +852,7 @@ class MoELayer(BaseMoELayer):
         kernel through the inference dispatcher and the experts' own inference
         adapter, which owns its weights separately from the training scratch.
         """
-        return self.mega_training_forward and not InferenceMode.is_active()
+        return self.inference_training_forward and not InferenceMode.is_active()
 
     def backward_dw(self, routed_experts: bool = True, shared_experts: bool = False):
         """Compute weight gradients for experts and shared experts."""

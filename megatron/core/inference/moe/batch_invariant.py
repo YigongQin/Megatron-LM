@@ -72,12 +72,17 @@ def _squared_relu_with_probs_kernel(
 ):
     """Apply squared ReLU and router probabilities in training order.
 
-    With CLAMP set this reproduces training's fused ``weighted_clamped_squared_relu`` bit
-    for bit: the soft-clamped pre-activation and the square both stay in FP32, and the only
-    BF16 round is the final one after the FP32 routing probability is applied.
+    Reproduces training's fused ``weighted_clamped_squared_relu`` (CLAMP) and
+    ``weighted_squared_relu`` (no CLAMP) bit for bit: everything after the BF16 load stays
+    in FP32, and the only BF16 round is the final one after the FP32 routing probability is
+    applied.
 
-    Without CLAMP the square is materialized in BF16 first, matching the unclamped
-    ``weighted_squared_relu``, which squares a BF16 ReLU output.
+    The unclamped branch used to round the square to BF16 before applying the probability,
+    on the reading that ``torch.pow(F.relu(x), 2)`` on a BF16 tensor materializes a BF16
+    square. It does not under ``@jit_fuser``: the fusion keeps the intermediate in FP32 and
+    rounds once at the output. That extra round cost 12% of routed tokens their last bit,
+    which is a non-zero KL on a squared-ReLU model. See
+    tests/unit_tests/inference/test_bi_moe_activation_parity.py.
     """
     pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
@@ -99,11 +104,6 @@ def _squared_relu_with_probs_kernel(
                     if CLAMP:
                         value = clamp_scale * libdevice.tanh(value / clamp_scale)
                     value = value * value
-                    if not CLAMP:
-                        # Unclamped training (weighted_squared_relu) squares a BF16 ReLU
-                        # output, so the BF16 materialization is part of matching it. The
-                        # clamped path stays in FP32 to the single final round instead.
-                        value = value.to(tl.bfloat16).to(tl.float32)
                     value = (value * prob).to(tl.bfloat16)
                     tl.store(output_ptr + row_i64 * hidden_size + cols, value, mask=mask)
             elif ZERO_PADDING:

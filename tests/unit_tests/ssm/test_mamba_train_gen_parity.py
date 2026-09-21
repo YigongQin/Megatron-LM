@@ -298,6 +298,13 @@ class TestMixerTrainingMatchesPrefill:
             batch_invariant_backend="te_native",
             attention_backend=AttnBackend.flash,
             flash_attention_version=4,
+            # Required: batch-invariant mode rejects attention dropout, and
+            # TransformerConfig defaults it to 0.1. hidden_dropout goes with it
+            # for a second reason -- the training side of this comparison runs
+            # a module in train mode, and any live dropout would make the two
+            # forwards differ for a reason that has nothing to do with parity.
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
         )
         submodules = hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
@@ -326,7 +333,9 @@ class TestMixerTrainingMatchesPrefill:
             mamba_metadata=SimpleNamespace(
                 seq_idx=torch.zeros((1, seqlen), dtype=torch.int32, device=device),
                 cu_seqlens=torch.tensor([0, seqlen], dtype=torch.int32, device=device),
-                batch_indices_prefill=torch.tensor([0], dtype=torch.long, device=device),
+                # int32, matching how the real context allocates it. The BIK
+                # seed path asserts on the dtype rather than casting.
+                batch_indices_prefill=torch.tensor([0], dtype=torch.int32, device=device),
                 intermediate_chunk_indices=None,
                 intermediate_abs_positions=None,
                 intermediate_real_count=None,
@@ -339,51 +348,104 @@ class TestMixerTrainingMatchesPrefill:
             mamba_slot_allocator=None,
         )
 
+    def _compare(self, mixer, ssm_state_dtype, label):
+        """Training forward vs dynamic prefill, with the state cache dtype varied.
+
+        ``ssm_prefill`` forwards ``ssm_state.dtype`` to the scan as
+        ``state_dtype``, so this argument decides the precision of the
+        inter-chunk carry on the prefill side. Training's carry is whatever the
+        installed mamba_ssm materializes and is not selectable here, which is
+        the whole reason this is a parameter: matching it isolates the wiring,
+        and not matching it reproduces what a real run does.
+        """
+        device = torch.device("cuda")
+        # Two chunks, so the state-passing carry between them is exercised. A
+        # sequence inside a single chunk can agree while the carry does not,
+        # and the carry is what a rollout depends on.
+        seqlen = 2 * mixer.chunk_size
+        torch.manual_seed(0)
+        hidden = torch.randn(
+            seqlen, 1, mixer.config.hidden_size, device=device, dtype=torch.bfloat16
+        )
+
+        train_out, _ = mixer(hidden)
+
+        # Mirror forward()'s tail rather than calling forward again: the
+        # inference branch needs a context, and reproducing the same three
+        # steps (project, run the SSM, project back) is what makes the two
+        # sides comparable at the layer's output.
+        conv_shape, ssm_shape = mixer.mamba_state_shapes_per_request()
+        conv_state = torch.zeros(1, *conv_shape, device=device, dtype=torch.bfloat16)
+        ssm_state = torch.zeros(1, *ssm_shape, device=device, dtype=ssm_state_dtype)
+        with torch.inference_mode():
+            zxBCdt, _ = mixer.in_proj(hidden)
+            y = mixer.ssm_prefill(
+                zxBCdt=zxBCdt,
+                conv_state=conv_state,
+                ssm_state=ssm_state,
+                context=self._prefill_context(seqlen, device),
+            )
+            prefill_out, _ = mixer.out_proj(y.reshape(seqlen, 1, -1))
+
+        return _report(label, train_out.reshape(-1), prefill_out.reshape(-1))
+
     def test_training_forward_matches_dynamic_prefill(self):
-        """Bitwise, through the real module on one set of weights."""
+        """With the carry precision matched, does the wiring agree bitwise?
+
+        BF16 cache, so prefill's ``state_dtype`` matches what the pinned
+        mamba_ssm materializes for training. That removes the one known
+        precision asymmetry and leaves only the wiring under test, which is
+        what this class is for.
+        """
         mixer = self._build_mixer()
         try:
-            device = torch.device("cuda")
-            # Two chunks, so the state-passing carry between them is exercised.
-            # A sequence inside a single chunk can agree while the carry does
-            # not, and the carry is what a rollout depends on.
-            seqlen = 2 * mixer.chunk_size
-            torch.manual_seed(0)
-            hidden = torch.randn(
-                seqlen, 1, mixer.config.hidden_size, device=device, dtype=torch.bfloat16
-            )
-
-            train_out, _ = mixer(hidden)
-
-            # Mirror forward()'s tail rather than calling forward again: the
-            # inference branch needs a context, and reproducing the same three
-            # steps (project, run the SSM, project back) is what makes the two
-            # sides comparable at the layer's output.
-            conv_shape, ssm_shape = mixer.mamba_state_shapes_per_request()
-            conv_state = torch.zeros(1, *conv_shape, device=device, dtype=torch.bfloat16)
-            ssm_state = torch.zeros(1, *ssm_shape, device=device, dtype=torch.bfloat16)
-            with torch.inference_mode():
-                zxBCdt, _ = mixer.in_proj(hidden)
-                y = mixer.ssm_prefill(
-                    zxBCdt=zxBCdt,
-                    conv_state=conv_state,
-                    ssm_state=ssm_state,
-                    context=self._prefill_context(seqlen, device),
-                )
-                prefill_out, _ = mixer.out_proj(y.reshape(seqlen, 1, -1))
-
-            same = _report(
-                "mixer training forward vs dynamic prefill",
-                train_out.reshape(-1),
-                prefill_out.reshape(-1),
+            same = self._compare(
+                mixer, torch.bfloat16, "mixer training vs prefill (carry matched, bf16)"
             )
             assert same, (
                 "the mixer's training forward does not reproduce its own prefill "
-                "bitwise, even though the underlying kernels do (TestScanParity). "
-                "That points at the wiring rather than the kernels: gate placement "
-                "in _static_prefill, the gated norm, or the conv state. This is the "
-                "MoE expert-ordering failure in a different layer, and it cannot be "
-                "found by comparing kernels."
+                "bitwise even with the carry precision matched, so the cause is the "
+                "wiring rather than dtype: gate placement in _static_prefill, the "
+                "gated norm, or the conv state. This is the MoE expert-ordering "
+                "failure in a different layer, and comparing kernels cannot find it."
+            )
+        finally:
+            from tests.unit_tests.test_utilities import Utils
+
+            Utils.destroy_model_parallel()
+
+    def test_fp32_state_cache_does_not_change_the_output(self):
+        """The dtype production actually uses, which is the one that matters.
+
+        ``batch_invariant_mode`` forces the SSM state cache to FP32 so decode
+        resumes from an unrounded boundary, and ``ssm_prefill`` passes that
+        dtype down as the scan's ``state_dtype``. Training cannot match it --
+        the pinned mamba_ssm hardcodes ``out_dtype=C.dtype`` -- so the two sides
+        do store the inter-chunk states at different precision.
+
+        It does not follow that their outputs differ, and they do not. The scan
+        consumes a BF16 view of those states on the output path either way, so
+        the dtype governs the snapshot decode resumes from, not the activations
+        this comparison sees. The same reasoning is spelled out for the GDP
+        kernel in ssm/ops/gdp/chunk.py.
+
+        Worth pinning rather than assuming: it is the reason a hybrid parity run
+        needs no mamba_ssm upgrade, and if it ever stops holding, output parity
+        silently acquires a dependency on the state cache dtype.
+        """
+        mixer = self._build_mixer()
+        try:
+            same = self._compare(
+                mixer, torch.float32, "mixer training vs prefill (fp32 cache, as production)"
+            )
+            assert same, (
+                "prefill output now depends on the SSM state cache dtype, which it "
+                "did not before: at FP32 it no longer matches the training forward, "
+                "while the BF16 comparison above still passes. The scan has started "
+                "consuming the states at their stored precision on the output path, "
+                "so training must now match it -- which needs a mamba_ssm exposing "
+                "state_dtype (state-spaces/mamba#972, the rev Megatron-LM pins) plus "
+                "mamba_training_ssm_states_dtype=float32."
             )
         finally:
             from tests.unit_tests.test_utilities import Utils

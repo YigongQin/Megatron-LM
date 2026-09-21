@@ -1400,6 +1400,29 @@ class TransformerConfig(ModelParallelConfig):
     bf16 backward is a straight-through estimator, which is a training-recipe
     decision rather than a drop-in."""
 
+    moe_inference_training_forward: bool = False
+    """Run the training MoE forward through the inference expert kernel, whichever
+    inference_grouped_gemm_backend selects, keeping TE for the backward.
+
+    The backend-agnostic form of moe_mega_training_forward, which is now one case
+    of it. Setting that flag implies this one; set this one directly for any other
+    backend. Supported today: 'flashinfer_mega' and 'vllm'.
+
+    The motivation is that matching an inference kernel's arithmetic by hand does
+    not scale. Each backend rounds where it rounds, and reproducing that in the
+    training path is a per-kernel effort that silently rots -- the squared-ReLU
+    activation is the worked example, where the inference kernel materializes its
+    square in BF16 specifically to mirror a training expression whose precision
+    depends on what the JIT fuser does with it. Running the inference kernel in
+    the value pass makes the forward equal by construction instead, for any
+    backend, including ones whose experts the mega kernel cannot represent
+    (squared ReLU has no gated weight layout).
+
+    The cost is the same trade mega already makes: the backward comes from the TE
+    recompute, so gradients are TE's while the value is the inference kernel's.
+    That is a straight-through estimator whenever the two differ by more than
+    rounding, and it is the reason this is opt-in rather than a default."""
+
     moe_mega_training_straight_through: bool = False
     """Allow moe_mega_training_forward at a quantized inference_mega_precision.
 
@@ -2033,26 +2056,59 @@ class TransformerConfig(ModelParallelConfig):
                         "(moe_latent_size is set)."
                     )
 
+        # The mega flag is the original, backend-specific spelling and stays
+        # accepted: the working RL arm sets it and forwards it by name. It now
+        # means "this, with the mega backend", so resolve it into the general
+        # flag and validate once.
         if self.moe_mega_training_forward:
+            self.moe_inference_training_forward = True
+
+        if self.moe_inference_training_forward:
+            # Name whichever flag the caller actually set, so the message says
+            # something they can act on rather than pointing at an alias.
+            _flag = (
+                'moe_mega_training_forward'
+                if self.moe_mega_training_forward
+                else 'moe_inference_training_forward'
+            )
             # Checked before the backend so a non-inference_optimized config gets
             # the message that actually applies to it.
             if self.transformer_impl != 'inference_optimized':
                 raise ValueError(
-                    "moe_mega_training_forward requires "
+                    f"{_flag} requires "
                     "transformer_impl='inference_optimized', which is what builds the "
-                    f"mega-capable expert module; got '{self.transformer_impl}'."
+                    f"inference-capable expert module; got '{self.transformer_impl}'."
                 )
             # inference_grouped_gemm_backend is only converted from str to enum
             # above when the inference-optimized branch runs, so accept either.
             backend = self.inference_grouped_gemm_backend
             if isinstance(backend, InferenceGroupedGemmBackend):
                 backend = backend.value
-            if backend != InferenceGroupedGemmBackend.FLASHINFER_MEGA.value:
+            # Only these two have a training-side weight rebuild. 'torch' and
+            # 'flashinfer' would need one written before they can run the value
+            # pass, and would otherwise read weights the optimizer has moved.
+            _supported = (
+                InferenceGroupedGemmBackend.FLASHINFER_MEGA.value,
+                InferenceGroupedGemmBackend.VLLM.value,
+            )
+            if backend not in _supported:
                 raise ValueError(
-                    "moe_mega_training_forward requires "
-                    f"inference_grouped_gemm_backend='flashinfer_mega'; got '{backend}'."
+                    f"{_flag} supports inference_grouped_gemm_backend in {_supported}; "
+                    f"got '{backend}'. The value pass has to rebuild the kernel's "
+                    "weights from the live parameters every forward, and only those "
+                    "backends have that rebuild implemented."
                 )
-            if self.inference_mega_precision != 'bf16':
+            if self.moe_mega_training_forward and backend != (
+                InferenceGroupedGemmBackend.FLASHINFER_MEGA.value
+            ):
+                raise ValueError(
+                    "moe_mega_training_forward is the mega-specific spelling and "
+                    f"requires inference_grouped_gemm_backend='flashinfer_mega'; got "
+                    f"'{backend}'. Use moe_inference_training_forward for other backends."
+                )
+            if backend == InferenceGroupedGemmBackend.FLASHINFER_MEGA.value and (
+                self.inference_mega_precision != 'bf16'
+            ):
                 if not self.moe_mega_training_straight_through:
                     raise ValueError(
                         "moe_mega_training_forward requires "
@@ -3902,6 +3958,14 @@ class TransformerConfig(ModelParallelConfig):
                     "kernels pin their autotune configs instead of choosing per call "
                     "shape. Setting it after import has no effect; relaunch with it set."
                 )
+
+                # Deliberately nothing about mamba_training_ssm_states_dtype
+                # here. Inference forces its SSM state cache to FP32 under this
+                # mode and training follows params_dtype, so the inter-chunk
+                # states are stored at different precision -- but the scan
+                # consumes a BF16 view of them on the output path, so outputs
+                # still agree bitwise. Pinned by
+                # TestMixerTrainingMatchesPrefill::test_fp32_state_cache_does_not_change_the_output.
             # Context parallelism routes through TE's FA2 fwd/bwd kernels directly, which
             # cannot be pinned to another version; dropout is not batch-invariant.
             assert (

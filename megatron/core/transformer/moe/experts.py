@@ -1262,7 +1262,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self._flashinfer_mxfp8_token_capacity = config.inference_flashinfer_mxfp8_token_capacity
         self._mega_adapter = None
         self._mega_training_adapter = None
-        self._mega_training_forward = config.moe_mega_training_forward
+        self._inference_training_forward = config.moe_inference_training_forward
         # Generation's kernel-layout copy of the expert weights, and whether it
         # needs rebuilding. Allocated on first forward; only bf16 uses it, and
         # only a refit marks it stale. See _mega_inference_weights.
@@ -1278,7 +1278,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     config.inference_mega_precision in _MEGA_CALLER_OWNED_PRECISIONS
                 ),
             )
-            if self._mega_training_forward:
+            if self._inference_training_forward:
                 # A second adapter even though bf16 makes both caller-owned:
                 # the adapter binds the specific weight tensors at construction,
                 # and these two read different buffers -- generation its own
@@ -1296,8 +1296,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
                 )
         # Driven by MoELayer, which owns the distinction between the pass that
         # produces the layer output and the recompute pass that builds the
-        # backward graph. See MoELayer._mega_pass_is_value.
-        self._in_mega_recompute = False
+        # backward graph. See MoELayer._inference_pass_is_value.
+        self._in_inference_recompute = False
 
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
@@ -1776,6 +1776,81 @@ class InferenceGroupedMLP(TEGroupedMLP):
         )
         return output, None
 
+    def _inference_training_forward_pass(self, hidden_states, probs, routing_map):
+        """Run the configured inference expert kernel as the training value pass.
+
+        The generic entry point, mirroring how :meth:`forward` dispatches the
+        inference path: callers ask for "whatever generation runs" and this
+        resolves it, so adding a backend does not mean editing the caller.
+
+        Only the backends with a training-side weight story are reachable here;
+        ``__post_init__`` rejects the others, because the failure mode for a
+        missing weight rebuild is reading parameters the optimizer has moved,
+        which yields a plausible number rather than an error.
+        """
+        backend = self.inference_grouped_gemm_backend
+        if backend == InferenceGroupedGemmBackend.FLASHINFER_MEGA:
+            return self._mega_training_forward_pass(
+                hidden_states, probs, routing_map=routing_map
+            )
+        if backend == InferenceGroupedGemmBackend.VLLM:
+            return self._vllm_training_forward_pass(
+                hidden_states, probs, routing_map=routing_map
+            )
+        raise ValueError(
+            f"inference_grouped_gemm_backend={backend} has no training value pass. "
+            "Add one alongside _vllm_training_forward_pass and allow it in "
+            "TransformerConfig.__post_init__; the weight lifecycle is the part that "
+            "needs deciding, not the kernel call."
+        )
+
+    def _vllm_training_forward_pass(self, hidden_states, probs, routing_map):
+        """vLLM fused MoE during training, so the forward equals generation's.
+
+        Much simpler than :meth:`_mega_training_forward_pass`, for one reason:
+        ``_build_concatenated_weights`` does not copy the expert weights, it
+        redirects each parameter's ``.data`` to a view into the concatenated
+        buffer. The optimizer therefore writes through into the tensor this
+        kernel reads, and there is no per-forward repack to pay for or to get
+        wrong. Mega needs one only because its kernel layout is a permutation of
+        the parameter layout rather than a view of it.
+
+        The valid-tokens scalar is read rather than computed here: the
+        all-gather dispatcher's ``update_metadata`` fills it during
+        ``token_dispatch``, which the layer runs before expert compute on this
+        same pass, so it holds this pass's token count and not a stale
+        generation one.
+        """
+        assert routing_map is not None, "routing_map is required for the vLLM forward."
+        # Built lazily for the same reason as in the inference path: at __init__
+        # the weights are not loaded yet, so the views would alias the wrong
+        # storage. Idempotent after the first call.
+        if not self._concatenated_weights_built:
+            self._build_concatenated_weights()
+            self._concatenated_weights_built = True
+
+        routing_map, probs = self._mega_dense_routing_to_topk(routing_map, probs)
+        local_expert_start = self.ep_group.rank() * self.num_local_experts
+        output = vllm_fused_moe(
+            hidden_states,
+            probs,
+            self._fc1_weight,
+            self._fc2_weight,
+            activation_type=self._mcore_activation_type,
+            num_local_experts=self.num_local_experts,
+            local_expert_start=local_expert_start,
+            valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
+            routing_map=routing_map,
+            # No RSV buffer: that belongs to the NVLS dispatcher and its
+            # symmetric heap, which a training step does not have. The parity
+            # dispatcher is the NCCL all-gather, so let the kernel allocate and
+            # let the dispatcher's own combine do the cross-rank reduction.
+            out=None,
+            num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
+            activation_clamp_scale=self._activation_clamp_scale,
+        )
+        return output, None
+
     def forward(
         self,
         permuted_local_hidden_states: torch.Tensor,
@@ -1808,8 +1883,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             # Train/generation parity mode: the value-producing forward runs the
             # same kernel generation uses, while the recompute pass takes the TE
             # path to build the backward graph.
-            if self._mega_training_forward and not self._in_mega_recompute:
-                return self._mega_training_forward_pass(
+            if self._inference_training_forward and not self._in_inference_recompute:
+                return self._inference_training_forward_pass(
                     permuted_local_hidden_states, permuted_probs, routing_map=routing_map
                 )
             return super().forward(permuted_local_hidden_states, tokens_per_expert, permuted_probs)
