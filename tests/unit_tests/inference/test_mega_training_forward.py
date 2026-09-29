@@ -408,6 +408,7 @@ def _parallel_state():
     from megatron.core.inference.moe.mega import MegatronMegaMoEAdapter
     from megatron.core.transformer.moe.token_dispatcher_inference import (
         InferenceAllGatherDispatcherBase,
+        NVLSAllGatherVDispatcher,
     )
 
     Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=EP_SIZE)
@@ -440,6 +441,11 @@ def _parallel_state():
     reset_training_scratches()
     InferenceAllGatherDispatcherBase._valid_tokens_tensor = None
     MegatronMegaMoEAdapter.reset_shared_training()
+    # The symmetric heap is class-level and sized for one geometry. Left
+    # allocated it would satisfy the next test's lazy allocation, which is
+    # exactly the check that has to run for the NVLS parity arm to mean
+    # anything.
+    NVLSAllGatherVDispatcher._delete_buffers()
     if BATCH_INVARIANT:
         disable_batch_invariant_mode()
     Utils.destroy_model_parallel()
@@ -497,6 +503,366 @@ class TestMegaTrainingForwardRuns:
         torch.distributed.all_gather(gathered, out.contiguous(), group=edp_group)
         for other in gathered[1:]:
             assert torch.equal(gathered[0], other)
+
+
+class TestGroupedGemmTrainingForwardRuns:
+    """(1b) The same path on the backends whose kernel is not the megakernel.
+
+    Worth its own class rather than a parametrization of the one above, because
+    the two differ in the part that has been wrong: mega's parity dispatcher is
+    a class of its own, while torch and vLLM share the ordinary all-gather
+    dispatcher with the training path. Anything that identifies the value pass
+    by looking at the dispatcher is therefore correct for mega and wrong here,
+    which is a regression a mega-only test cannot see.
+    """
+
+    def _backend_config(self, backend, **overrides):
+        """A parity config on ``backend``, differing from mega only in the kernel.
+
+        ``moe_inference_training_forward`` rather than the mega spelling: the
+        mega flag is an alias that ``__post_init__`` resolves into this one, and
+        it is rejected on a backend that is not mega.
+        """
+        return _config(
+            mega_training=False,
+            inference_grouped_gemm_backend=backend,
+            moe_inference_training_forward=True,
+            **overrides,
+        )
+
+    @pytest.mark.parametrize("backend", ["torch", "vllm"])
+    def test_forward_backward_runs(self, backend):
+        _skip_unsupported_grouped_gemm_combo(backend, "nvls", mxfp8_params=False)
+        config = self._backend_config(backend)
+        layer = _build_layer(config).train()
+        hidden = _hidden(config, seed=0).requires_grad_(True)
+
+        out, _ = layer(hidden)
+        out.sum().backward()
+
+        assert out.shape == hidden.shape
+        assert out.dtype == torch.bfloat16
+        assert torch.isfinite(out).all()
+        # The backward must reach the expert weights through the recompute pass,
+        # not just the input.
+        assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+        fc1_grad = layer.experts.linear_fc1.weight0.grad
+        assert fc1_grad is not None, "expert weights received no gradient"
+        assert torch.isfinite(fc1_grad).all()
+        assert fc1_grad.abs().sum() > 0
+
+    @pytest.mark.parametrize("backend", ["torch", "vllm"])
+    def test_value_pass_is_handed_a_routing_map(self, backend):
+        """The value pass reaches the inference kernel, and with a routing map.
+
+        These kernels route internally, so the routing map is what tells them
+        which expert a token belongs to; without it there is nothing to run.
+
+        Asserted separately from the forward above because the two failures look
+        nothing alike. A layer that stops taking the inference kernel at all
+        still produces a finite output and finite gradients -- through TE -- and
+        the only thing wrong with it is that it is no longer the forward
+        generation runs, which is the entire point of the mode.
+        """
+        _skip_unsupported_grouped_gemm_combo(backend, "nvls", mxfp8_params=False)
+        config = self._backend_config(backend)
+        layer = _build_layer(config).train()
+        experts = layer.experts
+        original = experts._grouped_gemm_training_forward_pass
+        seen = []
+
+        def spy(hidden_states, probs, routing_map):
+            seen.append(routing_map)
+            return original(hidden_states, probs, routing_map=routing_map)
+
+        experts._grouped_gemm_training_forward_pass = spy
+        out, _ = layer(_hidden(config, seed=0).requires_grad_(True))
+        out.sum().backward()
+
+        assert len(seen) == 1, (
+            f"expected exactly one value pass through the inference kernel, saw {len(seen)}; "
+            "0 means the layer fell back to TE, >1 means the recompute took this path too"
+        )
+        assert seen[0] is not None, "the value pass ran without a routing map"
+        assert seen[0].shape[0] > 0
+
+
+def _skip_unsupported_grouped_gemm_combo(backend, dispatcher, mxfp8_params: bool):
+    """Skip the combinations MCore rejects, rather than reporting them as failures.
+
+    Two of them, both only under batch-invariant mode:
+
+    ``nccl`` is refused outright with expert parallelism, because the
+    batch-invariant ordered reduction lives in the NVLS combine. The nccl arm
+    is therefore a BI=0-only case; it is still worth running there, where it
+    isolates the weights from the combine.
+
+    ``torch`` needs DeepGEMM's bf16 grouped-GEMM bindings. Production does not,
+    because it reaches the MXFP8 branch through ``fp8_param`` and MXFP8 experts
+    use ``scaled_grouped_mm`` instead. This test installs MXFP8 on the
+    parameters without setting the config flags -- deliberately, to keep the
+    rest of the layer out of fp8 autocast -- so ``mxfp8_params_enabled`` reads
+    False here and the config asks for a DeepGEMM the real recipe never needs.
+    """
+    # From the kernels module, not transformer_config: that one imports the flag
+    # inside __post_init__, so it is not an attribute of the module.
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        HAVE_DEEPGEMM_BF16,
+    )
+
+    if not BATCH_INVARIANT:
+        return
+    if dispatcher == "nccl":
+        pytest.skip(
+            "batch_invariant_mode with EP > 1 requires the nvls dispatcher; "
+            "run this arm with BI=0"
+        )
+    if backend == "torch" and not mxfp8_params and not HAVE_DEEPGEMM_BF16:
+        pytest.skip("batch-invariant torch experts need DeepGEMM bf16 grouped-GEMM bindings")
+
+
+def _build_grouped_gemm_layer(config, for_inference: bool = False, max_tokens: int = LOCAL_TOKENS):
+    """``_build_layer`` for the all-gather backends.
+
+    Differs in which buffers a generation layer needs. Mega's passthrough owns
+    EP transport itself and wants only the valid-tokens scalar; torch and vLLM
+    go through the all-gather, and on NVLS that means the symmetric heap the
+    inference context allocates in production. Stood up here from the test's
+    own token count, which is the same thing the parity value pass now does.
+    """
+    from megatron.core import parallel_state
+    from megatron.core.transformer.moe.token_dispatcher_inference import (
+        NCCLAllGatherDispatcher,
+        NVLSAllGatherVDispatcher,
+    )
+
+    if for_inference:
+        NCCLAllGatherDispatcher.allocate_buffers()
+        if config.inference_moe_token_dispatcher_type == 'nvls':
+            NVLSAllGatherVDispatcher.allocate_buffers(
+                per_rank_worst_case_token_count=max_tokens,
+                topk=config.moe_router_topk,
+                hidden_size=config.moe_latent_size or config.hidden_size,
+                ep_group=parallel_state.get_expert_model_parallel_group(),
+            )
+    return get_inference_optimized_moe_spec()(config=config).cuda()
+
+
+def _install_te_mxfp8_expert_params(layer):
+    """Put the expert weights in TE MXFP8 storage, the way ``fp8_param`` does.
+
+    By hand rather than through ``config.fp8`` because the code under test reads
+    the storage on the live parameters rather than the config --
+    ``_expert_params_use_te_mxfp8`` asks ``_has_mxfp8_storage`` of each weight.
+    Setting the config flags instead would additionally put the whole layer,
+    attention and projections included, into fp8 autocast, which is a much
+    larger change than the one being tested and would make a failure hard to
+    attribute to the expert weight path.
+
+    Deterministic, so calling it on two layers holding equal BF16 weights leaves
+    them holding equal MXFP8 ones.
+    """
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+    quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+    experts = layer.experts
+    for linear_name in ("linear_fc1", "linear_fc2"):
+        linear = getattr(experts, linear_name)
+        for i in range(experts.num_local_experts):
+            weight = getattr(linear, f"weight{i}")
+            setattr(
+                linear,
+                f"weight{i}",
+                torch.nn.Parameter(
+                    quantizer(weight.data.to(torch.bfloat16)), requires_grad=False
+                ),
+            )
+
+
+class TestGroupedGemmTrainGenParityMXFP8:
+    """(2b) The MXFP8 train/generation forward parity mega already has, for torch and vLLM.
+
+    The counterpart of :class:`TestTrainGenParity`'s mxfp8 arm. Until this
+    existed the only MXFP8 evidence for these backends was
+    ``test_mxfp8_utils.test_training_mxfp8_stack_matches_generation``, which
+    compares two helper functions on a stub module. That is a real check of the
+    quantization route, and it is not a check that a layer built from those
+    helpers produces generation's numbers: it never builds a layer, never runs
+    a forward, and never exercises the kernel selection or the routing the
+    weights are consumed by.
+
+    What this still does not cover, and should be read as excluded rather than
+    implied: the refit. Both layers here start from the same TE MXFP8
+    parameters, whereas in RL generation's weights arrive over the wire as BF16
+    slices and are quantized by ``MXFP8ReshardTransform`` on the receiver. The
+    training pass quantizes the whole local parameter instead, and MXFP8 scales
+    are per-32-element block, so the two need not land on the same bits. That
+    asymmetry needs its own test.
+    """
+
+    def _configs(self, backend, dispatcher):
+        """``(generation, training)`` configs differing only in the parity flag.
+
+        No ``moe_mega_training_straight_through``: that opt-in exists because
+        the mega MXFP8 forward takes its gradient from a bf16 recompute, and it
+        is rejected on a backend that is not mega.
+
+        Parametrized over the dispatcher because that is where this most
+        recently broke, and the two cases answer different questions. ``nccl``
+        puts both sides on the same dispatcher, leaving the quantization route
+        and the kernel as the only difference, so a failure there is about the
+        weights. ``nvls`` is production's default and the harder case: the
+        value pass has to allocate the symmetric heap generation gets from the
+        inference context, and until it did it fell back to the NCCL
+        all-gather, which reduces across EP ranks through a different
+        collective and has no batch-invariant ordered path at all.
+        """
+        common = dict(
+            mega_training=False,
+            inference_grouped_gemm_backend=backend,
+            inference_moe_token_dispatcher_type=dispatcher,
+        )
+        generation = _config(**common)
+        training = _config(**common, moe_inference_training_forward=True)
+        return generation, training
+
+    @pytest.mark.parametrize("dispatcher", ["nccl", "nvls"])
+    @pytest.mark.parametrize("backend", ["torch", "vllm"])
+    def test_training_forward_matches_generation_forward(self, backend, dispatcher):
+        """The value pass must produce generation's bits, from MXFP8 weights.
+
+        Run under ``eval()`` and ``no_grad``, which is the log-prob pass RL
+        actually compares and the one whose disagreement shows up as KL. It is
+        also the simpler pass to read: without a backward there is no recompute,
+        so a mismatch is the value pass and nothing else.
+        """
+        from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
+
+        # mxfp8_params=False: the weights are MXFP8 but the config flags are
+        # not set, which is what the DeepGEMM requirement keys on.
+        _skip_unsupported_grouped_gemm_combo(backend, dispatcher, mxfp8_params=False)
+        gen_config, train_config = self._configs(backend, dispatcher)
+        gen_layer = _build_grouped_gemm_layer(gen_config, for_inference=True).eval()
+        train_layer = _build_grouped_gemm_layer(train_config).eval()
+        # Before either conversion, while the parameters still hold plain BF16:
+        # once generation's runs it has deleted the nn.Parameters this reads.
+        _copy_expert_weights(gen_layer, train_layer)
+
+        _install_te_mxfp8_expert_params(gen_layer)
+        _install_te_mxfp8_expert_params(train_layer)
+        assert train_layer.experts._expert_params_use_te_mxfp8(), (
+            "the training layer is not on the MXFP8 branch, so this test would compare "
+            "the concatenated-weights path instead and pass without covering anything"
+        )
+        # Generation's load-time conversion, replacing TE's MXFP8 parameters
+        # with MCore MXFP8Tensors. The training layer deliberately keeps the TE
+        # ones, which is the asymmetry the parity claim is about.
+        quantize_model_to_mxfp8(gen_layer, backend="triton")
+
+        hidden = _hidden(train_config, seed=1)
+        with torch.no_grad(), InferenceMode.active():
+            gen_out, _ = gen_layer(hidden)
+        with torch.no_grad():
+            train_out, _ = train_layer(hidden)
+
+        error = _measure(train_out, gen_out, f"mxfp8 train/gen parity ({backend}/{dispatcher})")
+        # Reduced like the error is. Taken locally it reads off whichever rank
+        # pytest happens to quote, which is not the rank the reported error came
+        # from -- the pair then prints as "0 elements differ" beside a nonzero
+        # rel_rms, which is the opposite of informative.
+        differing = torch.tensor([float((train_out != gen_out).sum().item())], device="cuda")
+        torch.distributed.all_reduce(differing, op=torch.distributed.ReduceOp.MAX)
+        differing = int(differing.item())
+        assert error == 0.0, (
+            f"mxfp8 train/gen parity broken on {backend}/{dispatcher}: rel_rms={error:.3e}, "
+            f"{differing}/{train_out.numel()} elements differ. Same weights and same "
+            "kernel, so this is the quantization route or the stacked layout, not rounding"
+        )
+
+
+class TestGroupedGemmTokenCountParityMXFP8:
+    """Does a token's MXFP8 expert output depend on how many tokens shared the launch?
+
+    The other parity tests hand both sides the same token count, so they cannot
+    see this. In RL they never match: generation decodes a few tokens per step
+    and the training log-prob pass takes a whole packed microbatch. Parity then
+    holds only if the kernel's result for a token is independent of batch size,
+    which is a property of tile selection and of how the tokens land in each
+    expert's group, not of the weights.
+
+    Two comparisons, so a failure says which side moved:
+
+    * generation wide vs generation chunked -- the kernel alone. A mismatch
+      here means the kernel is not batch-invariant, whatever the training path
+      does.
+    * training wide vs generation chunked -- the production case.
+
+    Batch-invariant mode only. That is what the recipe runs, and without it the
+    router alone is allowed to wobble with batch size.
+    """
+
+    @pytest.mark.parametrize("backend", ["torch", "vllm"])
+    def test_training_forward_matches_chunked_generation(self, backend):
+        from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
+
+        if not BATCH_INVARIANT:
+            pytest.skip("token-count invariance is a batch-invariant-mode property; run with BI=1")
+        _skip_unsupported_grouped_gemm_combo(backend, "nvls", mxfp8_params=False)
+
+        common = dict(
+            mega_training=False,
+            inference_grouped_gemm_backend=backend,
+            inference_moe_token_dispatcher_type="nvls",
+        )
+        gen_config = _config(**common)
+        train_config = _config(**common, moe_inference_training_forward=True)
+        # The symmetric heap is sized once, for the widest forward either side
+        # will make; the training pass reuses generation's rather than growing it.
+        widest = max(TRAIN_TOKEN_COUNTS)
+        gen_layer = _build_grouped_gemm_layer(
+            gen_config, for_inference=True, max_tokens=widest
+        ).eval()
+        train_layer = _build_grouped_gemm_layer(train_config).eval()
+        _copy_expert_weights(gen_layer, train_layer)
+        _install_te_mxfp8_expert_params(gen_layer)
+        _install_te_mxfp8_expert_params(train_layer)
+        assert train_layer.experts._expert_params_use_te_mxfp8()
+        quantize_model_to_mxfp8(gen_layer, backend="triton")
+
+        results = []
+        for count in TRAIN_TOKEN_COUNTS:
+            hidden = _hidden(train_config, seed=count, tokens=count)
+            with torch.no_grad(), InferenceMode.active():
+                gen_wide, _ = gen_layer(hidden)
+            gen_chunked = _chunked_generation(gen_layer, hidden, GEN_TOKENS)
+            with torch.no_grad():
+                train_wide, _ = train_layer(hidden)
+            results.append(
+                (
+                    count,
+                    _measure_token_count_parity(
+                        gen_wide, gen_chunked, f"{backend} kernel: gen wide vs gen chunked"
+                    ),
+                    _measure_token_count_parity(
+                        train_wide, gen_chunked, f"{backend} production: train wide vs gen chunked"
+                    ),
+                )
+            )
+
+        # Asserted after every count has printed, so one failure does not hide
+        # the numbers for the others.
+        for count, (kernel_err, kernel_bad), (prod_err, prod_bad) in results:
+            assert kernel_err == 0.0, (
+                f"{backend}: generation output depends on batch size at {count} vs "
+                f"{GEN_TOKENS} tokens (rel_rms={kernel_err:.3e}, {kernel_bad}/{count} tokens "
+                "differ). The kernel is not batch-invariant, independent of the training path."
+            )
+            assert prod_err == 0.0, (
+                f"{backend}: training at {count} tokens differs from generation at "
+                f"{GEN_TOKENS} (rel_rms={prod_err:.3e}, {prod_bad}/{count} tokens differ) "
+                "although the kernel itself is batch-invariant."
+            )
 
 
 class TestTrainGenParity:

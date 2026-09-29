@@ -1090,3 +1090,137 @@ def test_expert_parallel_params_get_separate_buffers(use_distributed_optimizer: 
             )
 
     Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA allocator")
+class TestSharedParamGradBufferOffload:
+    """Offload/reload of the one allocation MXFP8 uses for both params and grads.
+
+    Reproduces the layout ``_ParamAndGradBuffer`` builds for MXFP8 params,
+    where ``grad_data`` is the whole buffer and ``param_data`` is a view of it,
+    and drives the two methods directly. No MXFP8 params and no distributed
+    setup needed: the behaviour under test is how the resize guards compose
+    when the two views share a storage.
+    """
+
+    @staticmethod
+    def _make_buffer(shared, grad_dtype=torch.bfloat16):
+        # Built without __init__, which wants a model, a process group and a
+        # DDP config to lay out real parameters. Only the handful of fields the
+        # two offload methods touch matter here.
+        #
+        # On CUDA because the release-and-restore these methods are built on is
+        # a caching-allocator idiom: resizing a CPU storage to 0 and back leaves
+        # the tensor pointing at freed memory, and the first write segfaults.
+        buffer = _ParamAndGradBuffer.__new__(_ParamAndGradBuffer)
+        numel = 64
+        # The buffer's own element count, which is what re-materializing a
+        # released shared allocation is sized from.
+        buffer.numel = numel
+        if shared:
+            buffer.shared_buffer = torch.zeros(numel, dtype=grad_dtype, device="cuda")
+            if grad_dtype == torch.float32:
+                buffer.param_data = buffer.shared_buffer[: math.ceil(numel / 2)].view(
+                    torch.bfloat16
+                )
+            else:
+                buffer.param_data = buffer.shared_buffer
+            buffer.grad_data = buffer.shared_buffer
+        else:
+            buffer.param_data = torch.zeros(numel, dtype=torch.bfloat16, device="cuda")
+            buffer.grad_data = torch.zeros(numel, dtype=grad_dtype, device="cuda")
+        buffer.grad_data_size = 0
+        buffer.param_data_size = 0
+        buffer.param_data_cpu = None
+        return buffer
+
+    @pytest.mark.parametrize("grad_dtype", [torch.bfloat16, torch.float32])
+    @pytest.mark.parametrize("move_grads_on_reload", [False, True])
+    def test_reload_restores_storage(self, grad_dtype, move_grads_on_reload):
+        buffer = self._make_buffer(shared=True, grad_dtype=grad_dtype)
+        assert buffer._shares_param_grad_storage()
+        expected_size = buffer.param_data.storage().size()
+
+        buffer.offload_to_cpu(move_params=True, move_grads=True)
+        assert buffer.param_data.storage().size() == 0
+
+        # A params-only reload has to work: that is what the refit path asks
+        # for, and before the shared-storage branch existed it restored
+        # nothing, leaving the next write to fail on a storage of size 0.
+        buffer.reload_from_cpu(move_params=True, move_grads=move_grads_on_reload)
+        assert buffer.param_data.storage().size() == expected_size
+        # Writing the whole allocation proves it is really back, not just
+        # reporting a size. Synchronized so a bad write fails here rather than
+        # surfacing in whichever test happens to run next.
+        buffer.grad_data.zero_()
+        torch.cuda.synchronize()
+
+    @pytest.mark.parametrize("grad_dtype", [torch.bfloat16, torch.float32])
+    def test_reset_of_a_released_buffer_rematerializes_it(self, grad_dtype):
+        """``zero_grad_buffer`` on a released shared buffer must not touch null memory.
+
+        The refit zeroes the grad buffer and then copies parameters into the
+        same allocation, without a reload in between (the caller may have kept
+        the train buffers resident, or released them for a different reason).
+        A fill on a released storage fails asynchronously, so the error is
+        blamed on whatever synchronizes next; the synchronize here keeps it
+        attributed to this call.
+        """
+        buffer = self._make_buffer(shared=True, grad_dtype=grad_dtype)
+        expected_size = buffer.param_data.storage().size()
+
+        buffer.offload_to_cpu(move_params=False, move_grads=True)
+        assert buffer.param_data.storage().size() == 0
+
+        buffer.extra_main_grads = []
+        buffer.reset()
+        torch.cuda.synchronize()
+        assert buffer.param_data.storage().size() == expected_size
+        buffer.param_data.fill_(1)
+        torch.cuda.synchronize()
+
+    def test_reset_of_an_ordinary_buffer_with_released_grads_is_a_noop(self):
+        """``zero_grad_buffer`` visits every buffer, not only the shared one.
+
+        In the RL refit the grads of the ordinary (non-MXFP8) buffers are
+        offloaded too, and ``zero_grad_buffer`` still resets them. Zeroing a
+        released grad allocation faults on the device; this is what a
+        ``CUDA_LAUNCH_BLOCKING`` run of the refit named. The buffer must stay
+        released -- resetting it is not a request to bring it back.
+        """
+        buffer = self._make_buffer(shared=False)
+        buffer.extra_main_grads = []
+        buffer.offload_to_cpu(move_params=False, move_grads=True)
+        assert buffer.grad_data.storage().size() == 0
+
+        buffer.reset()
+        torch.cuda.synchronize()
+        assert buffer.grad_data.storage().size() == 0, "reset must not undo the offload"
+        assert buffer.param_data.storage().size() == 64, "params were not offloaded"
+
+    def test_unshared_buffer_keeps_the_general_path(self):
+        """Distinct allocations must not be routed into the shared branch.
+
+        Asserted through the state the two branches leave behind rather than a
+        data round-trip: only the general path takes a CPU copy, and taking one
+        is what tells the two apart.
+        """
+        buffer = self._make_buffer(shared=False)
+        assert not buffer._shares_param_grad_storage()
+
+        buffer.offload_to_cpu(move_params=True, move_grads=True)
+        assert buffer.param_data_cpu is not None
+        assert buffer.param_data_size == 64
+        assert buffer.grad_data_size == 64
+
+        # The step that used to go wrong. With both storages released their
+        # pointers are both null, so a check that compared pointers called two
+        # independent buffers "shared" here, and the reload below then wrote to
+        # a storage it had not resized -- an illegal memory access.
+        assert not buffer._shares_param_grad_storage()
+        buffer.reload_from_cpu(move_params=True, move_grads=True)
+        assert buffer.param_data.storage().size() == 64
+        assert buffer.grad_data.storage().size() == 64
+        buffer.param_data.fill_(1)
+        buffer.grad_data.zero_()
+        torch.cuda.synchronize()

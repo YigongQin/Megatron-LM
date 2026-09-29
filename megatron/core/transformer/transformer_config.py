@@ -1423,6 +1423,19 @@ class TransformerConfig(ModelParallelConfig):
     That is a straight-through estimator whenever the two differ by more than
     rounding, and it is the reason this is opt-in rather than a default."""
 
+    moe_inference_training_max_tokens_per_rank: Optional[int] = None
+    """Upper bound on the tokens one rank feeds a parity value pass.
+
+    Only read by moe_inference_training_forward with the NVLS dispatcher. That
+    dispatcher gathers through symmetric-memory buffers, which are allocated once
+    and cannot grow, so they have to be sized for the largest pass before the
+    first one runs. Left unset, they are sized from the first pass the layer
+    sees, which is only right if that pass is the largest -- a log-prob
+    microbatch padded to 512 tokens and a later one padded to 576 is enough to
+    break it. Set it from the microbatch bound (log-prob batch size times
+    max sequence length); it acts as a floor, so a larger first pass still wins.
+    """
+
     moe_mega_training_straight_through: bool = False
     """Allow moe_mega_training_forward at a quantized inference_mega_precision.
 
@@ -2084,12 +2097,16 @@ class TransformerConfig(ModelParallelConfig):
             backend = self.inference_grouped_gemm_backend
             if isinstance(backend, InferenceGroupedGemmBackend):
                 backend = backend.value
-            # Only these two have a training-side weight rebuild. 'torch' and
-            # 'flashinfer' would need one written before they can run the value
-            # pass, and would otherwise read weights the optimizer has moved.
+            # 'flashinfer' is the one left out: its routed kernel reads a
+            # shuffled Major-K copy derived from the parameters rather than a
+            # view of them, so it needs a per-forward rebuild written before it
+            # can run the value pass, and would otherwise read weights the
+            # optimizer has moved. Torch and vLLM share one value pass because
+            # they share the concatenated weights and, under MXFP8, the kernel.
             _supported = (
                 InferenceGroupedGemmBackend.FLASHINFER_MEGA.value,
                 InferenceGroupedGemmBackend.VLLM.value,
+                InferenceGroupedGemmBackend.TORCH.value,
             )
             if backend not in _supported:
                 raise ValueError(

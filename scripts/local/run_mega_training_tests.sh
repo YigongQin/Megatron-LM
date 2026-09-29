@@ -268,7 +268,7 @@ for phase in $PHASES; do
         loop)
             ranks=$GPUS
             target=$FORWARD
-            selector="-k 'ep_and_dp or replicas_agree or te_bf16'"
+            selector="-k 'ep_and_dp or replicas_agree or te_bf16 or GroupedGemm'"
             launches=1
             ;;
         # The generation side on its own: the caller-owned weight buffer and the

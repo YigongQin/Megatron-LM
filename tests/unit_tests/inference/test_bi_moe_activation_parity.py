@@ -221,20 +221,102 @@ class TestInferenceTrainingForwardConfig:
         with pytest.raises(ValueError, match="mega-specific spelling"):
             self._config(moe_mega_training_forward=True, moe_inference_training_forward=False)
 
-    def test_unsupported_backend_is_rejected_rather_than_silently_wrong(self):
-        """'torch' has no training-side weight rebuild.
+    def test_torch_backend_is_accepted(self):
+        """Torch shares the value pass with vLLM: same weights, and under MXFP8 same kernel."""
+        config = self._config(inference_grouped_gemm_backend='torch')
+        assert config.moe_inference_training_forward
 
-        Allowing it would read weights the optimizer has since moved, which
-        produces a plausible number rather than an error -- the worst failure
-        mode for a parity feature.
+    def test_unsupported_backend_is_rejected_rather_than_silently_wrong(self):
+        """'flashinfer' has no training-side weight rebuild.
+
+        Its routed kernel reads a shuffled Major-K copy derived from the
+        parameters rather than a view of them, so without a per-forward rebuild
+        it reads weights the optimizer has since moved -- a plausible number
+        rather than an error, the worst failure mode for a parity feature.
         """
         with pytest.raises(ValueError, match="rebuild"):
-            self._config(inference_grouped_gemm_backend='torch')
+            self._config(inference_grouped_gemm_backend='flashinfer')
 
     def test_recompute_is_required(self):
         """Without it there is no backward graph for the experts at all."""
         with pytest.raises(ValueError, match="recompute"):
             self._config(recompute_granularity=None, recompute_modules=None)
+
+
+class TestGroupedGemmKernelSelection:
+    """Which kernel the torch/vLLM expert compute runs, per backend and precision.
+
+    Generation and the training value pass have to reach the same one. The
+    interesting case is vLLM under MXFP8: its Triton kernel has no MXFP8 layout,
+    so generation falls back to MCore's scaled grouped GEMM. A value pass that
+    kept calling the vLLM kernel there would run a different forward than
+    generation while every config check passed -- exactly the silent bias this
+    path exists to remove.
+
+    Pinned on the predicate both callers read, so a truth table here is the
+    whole selection rule rather than a sample of it.
+    """
+
+    @staticmethod
+    def _select(backend, uses_mxfp8):
+        from types import SimpleNamespace
+
+        from megatron.core.inference.moe import InferenceGroupedGemmBackend
+        from megatron.core.transformer.moe.experts import InferenceGroupedMLP
+
+        stub = SimpleNamespace(
+            inference_grouped_gemm_backend=InferenceGroupedGemmBackend(backend),
+        )
+        return InferenceGroupedMLP._uses_mcore_grouped_gemm(stub, uses_mxfp8)
+
+    @pytest.mark.parametrize(
+        "backend,uses_mxfp8,expect_mcore",
+        [
+            ('vllm', False, False),
+            ('vllm', True, True),
+            ('torch', False, True),
+            ('torch', True, True),
+        ],
+    )
+    def test_selection(self, backend, uses_mxfp8, expect_mcore):
+        assert self._select(backend, uses_mxfp8) is expect_mcore
+
+    def test_vllm_defaults_to_its_own_kernel_before_the_weights_are_built(self):
+        """Generation's ``_uses_mxfp8_weights`` is None until a build sets it.
+
+        Both callers resolve the flag before selecting, so None should not reach
+        here; it falls to the vLLM kernel rather than raising because that is
+        the BF16 default, and a crash on an unreachable state would be noise.
+        """
+        assert self._select('vllm', None) is False
+
+
+class TestMxfp8TrainingForwardConfig:
+    """``moe_inference_training_forward`` under a model-level MXFP8 recipe.
+
+    Distinct from the mega MXFP8 case, which needs
+    ``moe_mega_training_straight_through`` because it pairs a quantized forward
+    with a BF16 recomputed backward. Here the recompute runs TE, which is MXFP8
+    too, so forward and backward share a precision and no extra opt-in applies.
+    The kernels still differ, but that is the premise of the whole path rather
+    than something specific to MXFP8.
+    """
+
+    @staticmethod
+    def _config(**overrides):
+        kwargs = dict(
+            fp8='hybrid',
+            fp8_recipe='mxfp8',
+            # Required by inference_optimized with the MXFP8 recipe.
+            fp8_param=True,
+        )
+        kwargs.update(overrides)
+        return TestInferenceTrainingForwardConfig._config(**kwargs)
+
+    @pytest.mark.parametrize("backend", ['vllm', 'torch'])
+    def test_mxfp8_is_accepted(self, backend):
+        config = self._config(inference_grouped_gemm_backend=backend)
+        assert config.moe_inference_training_forward
 
 
 class TestSwigluActivationParity:
