@@ -1671,14 +1671,80 @@ class _ParamAndGradBuffer:
         """
         Zero out the underlying grad_buffer.
         """
-        self.grad_data.zero_()
+        # Zeroing a released allocation launches a fill on a null pointer. That
+        # fails asynchronously, so it is reported by whichever synchronizing call
+        # comes next rather than here -- which is how an MXFP8 refit that zeroed
+        # the buffer and then copied into it blamed the copy.
+        # A shared buffer is brought back, because the parameters live in it and
+        # the caller is about to need them. An ordinary buffer whose grads were
+        # offloaded is left released: there is nothing to zero, since the reload
+        # that restores it zeroes it, and bringing it back here would undo an
+        # offload the caller asked for.
+        self.ensure_param_buffer_allocated()
+        if self.grad_data.untyped_storage().nbytes() > 0:
+            self.grad_data.zero_()
         for grad in self.extra_main_grads:
             grad.zero_()
+
+    def _shares_param_grad_storage(self) -> bool:
+        """Whether ``param_data`` and ``grad_data`` are views of one allocation.
+
+        True only for MXFP8 parameters, where the grad buffer doubles as the
+        destination of the parameter all-gather. Resizing the storage through
+        either view therefore resizes the other.
+        """
+        if self.param_data is None or self.grad_data is None:
+            return False
+        # Decided by construction, not by comparing storage pointers. A released
+        # storage reports a null pointer, so two independent buffers that have
+        # both been released compare equal -- which would send an ordinary
+        # buffer's reload down the shared branch and resize one allocation while
+        # writing to the other, still at size 0.
+        return getattr(self, "shared_buffer", None) is not None
+
+    def ensure_param_buffer_allocated(self) -> None:
+        """Re-materialize the param buffer if it has been released.
+
+        Only does anything for the MXFP8 shared allocation, where the param
+        buffer and the grad buffer are one storage, so whichever side asks for
+        the release frees both -- including a grads-only offload, which does
+        not look like it is giving up the parameters.
+
+        Sized from the buffer's own geometry rather than from a size recorded
+        at offload time, so callers that need the parameters can say so without
+        depending on an offload and a reload having been paired. Skipping the
+        reload is legitimate: it is what ``keep_train_buffers`` does.
+        """
+        if not self._shares_param_grad_storage():
+            return
+        storage = self.grad_data.untyped_storage()
+        wanted = self.numel * self.grad_data.element_size()
+        if storage.size() < wanted:
+            storage.resize_(wanted)
+            self.grad_data.zero_()
+            self.param_data_size = 0
 
     def offload_to_cpu(self, move_params: bool = True, move_grads: bool = True) -> None:
         """
         Offload the buffers to CPU.
         """
+        if self._shares_param_grad_storage():
+            # One allocation to release, and nothing worth copying off it: the
+            # params in it are all-gathered again before their next use and the
+            # grads are zeroed before theirs. The size is recorded through
+            # param_data alone, in param elements, which is the unit the reload
+            # resizes in; grad_data_size is left out because the two dtypes
+            # differ and a size in the wrong unit is worse than no size.
+            #
+            # Kept apart from the general case below, where the two guards run
+            # in sequence: grads are freed first, params then see a size-0
+            # storage and skip their copy, leaving ``param_data_cpu`` None. No
+            # later reload can resize the buffer after that, and the next write
+            # into it fails on a storage of size 0.
+            if (move_params or move_grads) and self.param_data.storage().size() > 0:
+                self.param_data_size = self.param_data.storage().size()
+                self.param_data.storage().resize_(0)
+            return
         if move_grads and self.grad_data is not None and self.grad_data.storage().size() > 0:
             self.grad_data_size = self.grad_data.storage().size()
             self.grad_data.storage().resize_(0)
@@ -1694,6 +1760,10 @@ class _ParamAndGradBuffer:
         """
         Reload the buffers from CPU.
         """
+        if self._shares_param_grad_storage():
+            if move_params or move_grads:
+                self.ensure_param_buffer_allocated()
+            return
         if (
             move_params
             and self.param_data is not None
