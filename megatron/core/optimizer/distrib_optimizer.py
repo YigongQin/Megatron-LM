@@ -2946,6 +2946,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             raise NotImplementedError(
                 "_copy_main_params_to_param_buffer not supported for Megatron-FSDP."
             )
+        # The MXFP8 param buffer shares one allocation with the grad buffer, so
+        # offloading either side releases it, and the reload that would bring it
+        # back is skipped whenever the caller kept the train buffers resident.
+        # Ask for the buffer rather than assume the last offload was paired.
+        for buffer in self.buffers:
+            buffer.ensure_param_buffer_allocated()
         for shard_main_group, model_group in zip(
             self.shard_fp32_from_float16_groups, self.model_float16_groups
         ):
@@ -2961,6 +2967,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # Get the correct slice of param buffer
                 shard_param_buffer = param_buffer.view(-1)[world_range.start : world_range.end]
 
+                # Checked here, where the answer is synchronous. A copy from or
+                # into a released allocation is not an error when it is issued --
+                # it faults on the device and is reported by whichever call
+                # synchronizes next, which sends the investigation to the wrong
+                # place.
+                if shard_main_param.untyped_storage().nbytes() == 0:
+                    raise RuntimeError(
+                        "Cannot stage main params into the param buffer: the FP32 main "
+                        f"param for {tuple(model_param.shape)} has no storage. The "
+                        "optimizer state was offloaded and not reloaded before this refit."
+                    )
+                if shard_param_buffer.numel() != shard_main_param.numel():
+                    raise RuntimeError(
+                        f"param buffer slice has {shard_param_buffer.numel()} elements but "
+                        f"the main param shard has {shard_main_param.numel()}"
+                    )
                 shard_param_buffer.copy_(shard_main_param)
 
         # Staging params into the DDP param buffer invalidates any prior "already
