@@ -387,6 +387,16 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
 
+    dsa_indexer_weights_proj_use_quantization: bool = True
+    """Whether ``DSAIndexer`` weights projection follows the enclosing FP8/FP4
+    quantization context. Disable this to keep the projection parameter outside FP8/FP4;
+    ``dsa_indexer_weights_proj_output_dtype`` then controls its BF16 or FP32 output contract."""
+
+    dsa_indexer_weights_proj_output_dtype: Literal["bf16", "fp32"] = "bf16"
+    """Output dtype of the ``DSAIndexer`` weights projection. BF16 preserves the existing
+    path. FP32 uses a true FP32-output projection and is not compatible with the cuDNN DSA
+    backend. The final index scores remain FP32 independently of this option."""
+
     ####################
     # Compressed sparse attention
     ####################
@@ -414,6 +424,11 @@ class TransformerConfig(ModelParallelConfig):
     Accepts either:
     - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
     - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
+
+    gdn_kernel_backend: Literal["transformer_engine", "fla", "torch"] = "fla"
+    """Kernel backend for Gated DeltaNet. The selected backend is required to be available;
+    there is no automatic fallback. ``torch`` selects the PyTorch-native reference
+    implementation and is required when deterministic mode is enabled."""
 
     linear_conv_kernel_dim: Optional[int] = 4
     """Conv kernel dimension for the gated delta net."""
@@ -618,7 +633,7 @@ class TransformerConfig(ModelParallelConfig):
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
     "shared_experts", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
-    "shortcut_pre_mlp_layernorm".
+    "shortcut_pre_mlp_layernorm", "residual_stream".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -636,8 +651,10 @@ class TransformerConfig(ModelParallelConfig):
             enable_mhc_connections=True. Cannot be used with "mlp".
     "shortcut_pre_mlp_layernorm": recompute the shortcut router's input normalization.
             Requires moe_shortcut_connection=True and selective recomputation.
-    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", and
-    "mhc" and "shortcut_pre_mlp_layernorm" use output-discarding checkpointing,
+    "residual_stream": replay wide-residual reads, connected norms, and writes via
+            CheckpointWithoutOutput + CheckpointWithoutOutputManager.
+    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    "shortcut_pre_mlp_layernorm", and "residual_stream" use output-discarding checkpointing;
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
@@ -985,11 +1002,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
-    moe_flex_dispatcher_backend: Literal['deepep', 'hybridep', 'ncclep'] = "deepep"
+    moe_flex_dispatcher_backend: Literal['deepep', 'deepepv2', 'hybridep', 'ncclep'] = "deepep"
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
-    Options are "deepep", "hybridep", and "ncclep". Currently only "hybridep" backend supports
-    the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via TransformerEngine's
-    transformer_engine.pytorch.ep API."""
+    Options are "deepep", "deepepv2", "hybridep", and "ncclep". Currently only "hybridep"
+    backend supports the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via
+    TransformerEngine's transformer_engine.pytorch.ep API."""
 
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
@@ -1063,8 +1080,9 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_flex_dispatcher_num_sms: Optional[int] = None
     """Number of SMs for the flex token dispatcher's dispatch/combine communication, for all
-    backends (deepep, hybridep, ncclep). None lets each backend use its own default. Unifies the
-    deprecated per-backend moe_{deepep,hybridep}_num_sms knobs (routed in __post_init__)."""
+    backends (deepep, deepepv2, hybridep, ncclep). None lets each backend use its own default.
+    Unifies the deprecated per-backend moe_{deepep,hybridep}_num_sms knobs (routed in
+    __post_init__)."""
 
     moe_deepep_num_sms: Optional[int] = None
     """DEPRECATED: use moe_flex_dispatcher_num_sms. Number of SMs to use for DeepEP (historical
@@ -1086,6 +1104,14 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_hybridep_num_sms_preprocessing: int = 108
     """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
+
+    moe_hybridep_routing_map_mode: Literal['indices', 'bool'] = 'indices'
+    """Routing-map format for HybridEP. ``indices`` requests int16 top-k indices and is the
+    default, while ``bool`` forces the bool token-to-expert map. Index routing remains gated on
+    Transformer Engine and HybridEP support and the int16 expert limit; unsupported configurations
+    fall back to the bool routing-map path. ``moe_pad_expert_input_to_capacity`` also forces the
+    bool path (with a warning): a pad-to-capacity routing map can hold more than topk assignments
+    per token, which dense top-k indices cannot represent."""
 
     moe_ncclep_zero_copy: bool = False
     """For the 'ncclep' flex dispatcher: use the NCCL symmetric-memory zero-copy IO path
@@ -1301,6 +1327,13 @@ class TransformerConfig(ModelParallelConfig):
     layers while attention and MLP branches continue to operate at ``hidden_size``.
     """
 
+    residual_stream_recompute_num_layers: Optional[int] = None
+    """Number of local layers per ordered residual-stream replay block.
+
+    ``None`` places all local layers in one block. This setting requires selective
+    recomputation with ``"residual_stream"`` in ``recompute_modules``.
+    """
+
     ####################
     # miscellaneous
     ####################
@@ -1371,19 +1404,43 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
-    inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm'] = "vllm"
+    inference_grouped_gemm_backend: Literal['flashinfer', 'flashinfer_mega', 'torch', 'vllm'] = (
+        "vllm"
+    )
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
     - 'flashinfer': Uses FlashInfer cutlass_fused_moe for BF16 and TRT-LLM routed
       block-scale MoE for MXFP8. The MXFP8 path retains canonical expert weights
       for refit and also stores a padded TRT-LLM Major-K copy, increasing
       expert-weight memory relative to the torch backend.
+    - 'flashinfer_mega': Uses FlashInfer moe_ep mega kernels, which fuse EP transport
+      and the expert MLP into one symmetric-memory kernel. Tokens stay local per rank,
+      so Megatron's NVLS/NCCL gather around the experts is bypassed. SwiGLU only.
     - 'torch': Uses torch.nn.functional.grouped_mm (mcore_fused_moe with Triton kernels).
       Supports both BF16 and MXFP8.
     - 'vllm': Uses vLLM's Triton fused MoE kernel for BF16. Avoids physical token
       permutation via indirect addressing. MXFP8 expert layers use MCore's scaled
       grouped-GEMM path, allowing per-layer mixed BF16/MXFP8 policies.
     """
+
+    inference_mega_precision: Literal['bf16', 'mxfp8', 'bf16_nvfp4'] = "bf16"
+    """Precision recipe for inference_grouped_gemm_backend='flashinfer_mega'. Selects
+    which FlashInfer sm100 megakernel variant to build:
+
+    - 'bf16': BF16 CuTeDSL kernel, no quantization.
+    - 'mxfp8': MXFP8 (e4m3) CuTeDSL kernel.
+    - 'bf16_nvfp4': BF16 activations times NVFP4 weights, CuTeDSL kernel.
+      Requires flashinfer-python >= 0.7.1.
+
+    NVFP4xNVFP4 and the DeepGEMM fp8 x fp4 kernel are not offered. The quantized
+    recipes take bf16 weights and quantize them for the kernel, independently of
+    Megatron's own --fp8 weight quantization. A weight refit rewrites the
+    caller-owned kernel buffer for every precision here."""
+
+    inference_mega_max_tokens_per_rank: int = 128
+    """Workspace capacity of the FlashInfer mega MoE kernel, in tokens per EP rank.
+    Sizes the symmetric-memory buffers, so a forward with more local tokens than this
+    is rejected rather than falling back."""
 
     inference_moe_disable_fused_quant_kernels: bool = False
     """When False (default), use fused kernels that combine permute/activation with
@@ -1572,7 +1629,11 @@ class TransformerConfig(ModelParallelConfig):
         """Validate context-parallel layout settings."""
         if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
             raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
-        if self.context_parallel_size > 1 and self.attention_cp_layout == "contiguous":
+        if (
+            self.context_parallel_size > 1
+            and self.attention_cp_layout == "contiguous"
+            and self.experimental_attention_variant != "dsv4_hybrid"
+        ):
             raise ValueError(
                 "attention_cp_layout='contiguous' is not yet supported with context parallelism."
             )
@@ -1628,12 +1689,6 @@ class TransformerConfig(ModelParallelConfig):
         if self.wide_residual is not None:
             if self.enable_mhc_connections:
                 raise ValueError("wide_residual and enable_mhc_connections are mutually exclusive.")
-            if self.moe_shortcut_connection:
-                raise NotImplementedError(
-                    "wide_residual does not yet support moe_shortcut_connection. "
-                    "ShortcutMoE groups and executes paired hybrid layers outside the ordinary "
-                    "wide-residual branch-connection path."
-                )
             if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
                 raise NotImplementedError(
                     "wide_residual does not yet support CUDA graphs; use cuda_graph_impl='none'."
@@ -1642,10 +1697,6 @@ class TransformerConfig(ModelParallelConfig):
                 raise NotImplementedError(
                     "wide_residual does not yet support pipeline_model_parallel_size > 1. "
                     "Inter-stage communication buffers are still sized from hidden_size."
-                )
-            if self.mtp_num_layers is not None:
-                raise NotImplementedError(
-                    "wide_residual does not yet support Multi-Token Prediction (MTP)."
                 )
             if self.inference_fuse_tp_communication:
                 raise NotImplementedError(
@@ -1746,7 +1797,43 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor_model_parallel_size ({self.tensor_model_parallel_size})."
             )
 
+        if self.gdn_kernel_backend not in {"transformer_engine", "fla", "torch"}:
+            raise ValueError(
+                "gdn_kernel_backend must be one of {'transformer_engine', 'fla', 'torch'}, "
+                f"got {self.gdn_kernel_backend!r}."
+            )
+
+        if self.dsa_indexer_weights_proj_output_dtype not in ("bf16", "fp32"):
+            raise ValueError(
+                "dsa_indexer_weights_proj_output_dtype must be either 'bf16' or 'fp32', got "
+                f"{self.dsa_indexer_weights_proj_output_dtype!r}."
+            )
+        if (
+            self.dsa_indexer_weights_proj_use_quantization
+            and self.dsa_indexer_weights_proj_output_dtype == "fp32"
+        ):
+            raise ValueError(
+                "dsa_indexer_weights_proj_output_dtype='fp32' requires "
+                "dsa_indexer_weights_proj_use_quantization=False because quantized "
+                "TELinear does not guarantee a true-FP32 output for this projection."
+            )
+        if (
+            self.dsa_indexer_weights_proj_output_dtype == "fp32"
+            and self.dsa_kernel_backend == "cudnn"
+        ):
+            raise ValueError(
+                "dsa_indexer_weights_proj_output_dtype='fp32' is not supported by "
+                "dsa_kernel_backend='cudnn', which requires a BF16 indexer weights tensor. "
+                "Use dsa_kernel_backend='tilelang' or 'none'."
+            )
+
         if is_gated_delta_net_variant(self.experimental_attention_variant):
+            if self.deterministic_mode and self.gdn_kernel_backend != "torch":
+                raise ValueError(
+                    "deterministic_mode=True requires gdn_kernel_backend='torch' for "
+                    "Gated DeltaNet."
+                )
+
             # gdn2 may also be enabled for GDN layers built via the hybrid layer pattern
             # symbol 'G', where linear_attention_freq is unused; the GPT experimental
             # attention route raises a clear error downstream if it is missing.
@@ -1818,9 +1905,12 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.tensor_model_parallel_size == 1
             ), "DSv4 Hybrid Attention only supports TP size 1."
-            assert (
-                self.context_parallel_size == 1
-            ), "DSv4 Hybrid Attention does not support context parallelism yet."
+            if self.context_parallel_size > 1 and self.attention_cp_layout != "contiguous":
+                raise ValueError(
+                    "DSv4 context parallelism requires attention_cp_layout='contiguous'."
+                )
+            if self.hybrid_context_parallel:
+                raise ValueError("DSv4 dynamic context parallelism is not supported yet.")
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             if self.dsa_kernel_backend == "tilelang":
                 raise ValueError(
@@ -1962,11 +2052,12 @@ class TransformerConfig(ModelParallelConfig):
             if self.gated_linear_unit and self.inference_grouped_gemm_backend not in (
                 InferenceGroupedGemmBackend.TORCH,
                 InferenceGroupedGemmBackend.VLLM,
+                InferenceGroupedGemmBackend.FLASHINFER_MEGA,
             ):
                 raise ValueError(
                     "--transformer-impl='inference_optimized' supports gated linear units "
-                    "(SwiGLU/GeGLU) only with --inference-grouped-gemm-backend torch or vllm, "
-                    f"got '{self.inference_grouped_gemm_backend}'."
+                    "(SwiGLU/GeGLU) only with --inference-grouped-gemm-backend torch, vllm, "
+                    f"or flashinfer_mega, got '{self.inference_grouped_gemm_backend}'."
                 )
 
             if mxfp8_enabled:
@@ -1975,6 +2066,87 @@ class TransformerConfig(ModelParallelConfig):
                         "fp8_param must be enabled when using "
                         "--transformer-impl='inference_optimized' with --fp8-recipe='mxfp8'. "
                         "Please set --fp8-param-gather."
+                    )
+
+            if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER_MEGA:
+                if self.inference_mega_max_tokens_per_rank <= 0:
+                    raise ValueError(
+                        "inference_mega_max_tokens_per_rank must be positive for flashinfer_mega."
+                    )
+                # Megatron-side MXFP8 stores expert weights as MXFP8Tensor, which the
+                # mega weight packer cannot read. The mega kernels do their own
+                # quantization from bf16 weights, selected by inference_mega_precision.
+                if mxfp8_enabled:
+                    raise ValueError(
+                        "flashinfer_mega cannot consume Megatron-side MXFP8 weights; "
+                        "disable --fp8 and select the kernel's own quantization with "
+                        "inference_mega_precision (bf16, mxfp8, bf16_nvfp4)."
+                    )
+                # The megakernel stacks gate+up into w13 and applies SwiGLU, so a
+                # non-gated activation has no representable weight layout.
+                if not self.gated_linear_unit or self.activation_func != F.silu:
+                    raise ValueError(
+                        "flashinfer_mega only implements SwiGLU; set "
+                        "gated_linear_unit=True with activation_func=F.silu."
+                    )
+                # FlashInfer hard-clamps the FC1 output while
+                # activation_func_tanh_clamp_scale is a soft tanh clamp replacing
+                # the swish gate (SiTU-GLU). The two are not interchangeable.
+                if self.activation_func_tanh_clamp_scale is not None:
+                    raise ValueError(
+                        "flashinfer_mega does not implement "
+                        "activation_func_tanh_clamp_scale (SiTU-GLU); the megakernel "
+                        "only offers a hard FC1 clamp."
+                    )
+                # Shape alignment is per precision: each kernel's weight
+                # interleaving and activation-staging quantizer impose their own
+                # bounds. Enforced here so a bad geometry fails at config time
+                # rather than inside the first forward on every EP rank.
+                # (hidden divisor, post-SwiGLU moe_ffn divisor)
+                mega_alignment = {
+                    'bf16': (32, 64),
+                    'mxfp8': (64, 32),
+                    # BF16 token transport (hidden % 32) and the W4A16 kernel's
+                    # own intermediate check (% 64, stricter than the fleet's 32).
+                    'bf16_nvfp4': (32, 64),
+                }
+                if self.inference_mega_precision not in mega_alignment:
+                    raise ValueError(
+                        "inference_mega_precision must be one of "
+                        f"{sorted(mega_alignment)}; got "
+                        f"'{self.inference_mega_precision}'."
+                    )
+                hidden_div, ffn_div = mega_alignment[self.inference_mega_precision]
+                if self.hidden_size % hidden_div:
+                    raise ValueError(
+                        f"flashinfer_mega with inference_mega_precision="
+                        f"'{self.inference_mega_precision}' requires hidden_size "
+                        f"divisible by {hidden_div}; got {self.hidden_size}."
+                    )
+                if self.moe_ffn_hidden_size % ffn_div:
+                    raise ValueError(
+                        f"flashinfer_mega with inference_mega_precision="
+                        f"'{self.inference_mega_precision}' requires "
+                        f"moe_ffn_hidden_size divisible by {ffn_div}; "
+                        f"got {self.moe_ffn_hidden_size}."
+                    )
+                # The W4A16 kernel rejects top_k above 32 at init. Fail here so
+                # a bad router setting does not wait for the first EP forward.
+                if self.inference_mega_precision == 'bf16_nvfp4' and self.moe_router_topk > 32:
+                    raise ValueError(
+                        "flashinfer_mega with inference_mega_precision='bf16_nvfp4' "
+                        f"requires moe_router_topk <= 32; got {self.moe_router_topk}."
+                    )
+                if self.num_moe_experts % self.expert_model_parallel_size:
+                    raise ValueError(
+                        "flashinfer_mega requires num_moe_experts divisible by "
+                        f"expert_model_parallel_size; got {self.num_moe_experts} and "
+                        f"{self.expert_model_parallel_size}."
+                    )
+                if self.moe_latent_size is not None:
+                    raise ValueError(
+                        "flashinfer_mega does not support latent MoE yet "
+                        "(moe_latent_size is set)."
                     )
 
             if (
@@ -2010,14 +2182,19 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
             if self.batch_invariant_mode:
+                # flashinfer_mega composes with batch-invariant mode because the
+                # two cover disjoint parts of the layer: the megakernel replaces
+                # only the expert compute, while batch-invariant mode covers
+                # attention, the projections, the norms and the router.
                 if self.inference_grouped_gemm_backend not in (
                     InferenceGroupedGemmBackend.FLASHINFER,
                     InferenceGroupedGemmBackend.TORCH,
                     InferenceGroupedGemmBackend.VLLM,
+                    InferenceGroupedGemmBackend.FLASHINFER_MEGA,
                 ):
                     raise ValueError(
                         "batch_invariant_mode requires inference_grouped_gemm_backend "
-                        "'flashinfer', 'torch', or 'vllm'."
+                        "'flashinfer', 'flashinfer_mega', 'torch', or 'vllm'."
                     )
                 if (
                     self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
@@ -2028,8 +2205,14 @@ class TransformerConfig(ModelParallelConfig):
                         "backend only for an MXFP8 model configuration. Selectively BF16 "
                         "expert layers within that configuration remain supported."
                     )
+                # The nvls requirement is about the dispatcher's cross-rank
+                # combine. The megakernel never reaches it: it owns EP transport
+                # and forces the passthrough dispatcher, ignoring
+                # inference_moe_token_dispatcher_type entirely.
                 if (
-                    self.expert_model_parallel_size > 1
+                    self.inference_grouped_gemm_backend
+                    != InferenceGroupedGemmBackend.FLASHINFER_MEGA
+                    and self.expert_model_parallel_size > 1
                     and self.inference_moe_token_dispatcher_type != "nvls"
                 ):
                     raise ValueError(
@@ -2101,7 +2284,7 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
-            if self.moe_flex_dispatcher_backend == "hybridep":
+            if self.moe_flex_dispatcher_backend != "deepep":
                 raise ValueError("Only one backend is supported for flex token dispatcher.")
             self.moe_flex_dispatcher_backend = "deepep"
             warnings.warn(
@@ -2111,12 +2294,27 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_token_dispatcher_type == "flex":
             if self.moe_pad_expert_input_to_capacity and (
-                self.moe_enable_deepep or self.moe_flex_dispatcher_backend == "deepep"
+                self.moe_enable_deepep or self.moe_flex_dispatcher_backend in ("deepep", "deepepv2")
             ):
                 raise ValueError(
                     "Flex token dispatcher with deepep backend does not support "
                     "moe_pad_expert_input_to_capacity"
                 )
+
+        if self.moe_hybridep_routing_map_mode not in ("indices", "bool"):
+            raise ValueError("moe_hybridep_routing_map_mode must be one of 'indices' or 'bool'.")
+        if (
+            self.moe_hybridep_routing_map_mode == "indices"
+            and self.moe_pad_expert_input_to_capacity
+            and self.moe_token_dispatcher_type == "flex"
+            and self.moe_flex_dispatcher_backend == "hybridep"
+        ):
+            warnings.warn(
+                "moe_hybridep_routing_map_mode='indices' is disabled by "
+                "moe_pad_expert_input_to_capacity: a pad-to-capacity routing map can hold more "
+                "than topk assignments per token, which dense top-k indices cannot represent. "
+                "HybridEP will use the bool routing-map path."
+            )
 
         if self.moe_flex_dispatcher_backend == "ncclep":
             if self.moe_token_dispatcher_type != "flex":
@@ -2353,6 +2551,7 @@ class TransformerConfig(ModelParallelConfig):
                     "gdp_qkv",
                     "mhc",
                     "shortcut_pre_mlp_layernorm",
+                    "residual_stream",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -2454,6 +2653,47 @@ class TransformerConfig(ModelParallelConfig):
                     "the offloading backward chunk is initialized, causing tensor_pop "
                     "on a None chunk. Disable one of them."
                 )
+
+        use_residual_stream_recompute = (
+            self.recompute_granularity == "selective"
+            and "residual_stream" in self.recompute_modules
+        )
+        if "residual_stream" in self.recompute_modules and not use_residual_stream_recompute:
+            raise ValueError(
+                "'residual_stream' in recompute_modules requires "
+                "recompute_granularity='selective'."
+            )
+        if use_residual_stream_recompute:
+            if self.wide_residual is None:
+                raise ValueError(
+                    "'residual_stream' recomputation requires a configured wide residual stream."
+                )
+            if self.residual_stream_recompute_num_layers is not None and (
+                isinstance(self.residual_stream_recompute_num_layers, bool)
+                or not isinstance(self.residual_stream_recompute_num_layers, int)
+                or self.residual_stream_recompute_num_layers < 1
+            ):
+                raise ValueError(
+                    "residual_stream_recompute_num_layers must be a positive integer or None."
+                )
+            if self.fine_grained_activation_offloading:
+                replay_owned_norms = {"attn_norm", "mlp_norm"} & set(self.offload_modules or [])
+                if replay_owned_norms:
+                    warnings.warn(
+                        "Residual-stream recomputation owns residual reads, connected-branch "
+                        "norms, and writes. Fine-grained activation offloading will skip "
+                        f"{sorted(replay_owned_norms)} only on connected branches."
+                    )
+            if self.cuda_graph_impl != "none":
+                raise ValueError(
+                    "'residual_stream' recomputation requires cuda_graph_impl='none' because "
+                    "its Python checkpoint manager remains outside CUDA graph capture."
+                )
+        elif self.residual_stream_recompute_num_layers is not None:
+            raise ValueError(
+                "residual_stream_recompute_num_layers requires selective recomputation with "
+                "'residual_stream' in recompute_modules."
+            )
 
         if self.enable_mhc_connections and not (
             self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
@@ -3719,6 +3959,18 @@ class TransformerConfig(ModelParallelConfig):
                 "training and inference attention paths run the same batch-invariant "
                 f"FlashAttention kernel (got {self.flash_attention_version})."
             )
+            if self.is_hybrid_model:
+                from megatron.core.ssm.ops.common.determinism import use_deterministic_mode
+
+                # Checked rather than set: the autotune config lists are fixed at
+                # import, so setting the flag here would change nothing.
+                assert use_deterministic_mode(), (
+                    "Batch invariant mode on a hybrid model requires MAMBA_DETERMINISTIC=1 "
+                    "in the environment before Megatron is imported, so the SSM Triton "
+                    "kernels pin their autotune configs instead of choosing per call "
+                    "shape. Setting it after import has no effect; relaunch with it set."
+                )
+
             # Context parallelism routes through TE's FA2 fwd/bwd kernels directly, which
             # cannot be pinned to another version; dropout is not batch-invariant.
             assert (
@@ -3835,10 +4087,21 @@ class TransformerConfig(ModelParallelConfig):
             # allgather specifically, the general variable_seq_lengths check
             # above raises first (packing derives variable_seq_lengths=True).
             if self.num_moe_experts is not None:
-                assert self.moe_token_dispatcher_type == "alltoall", (
-                    f"sequence_packing only supports moe_token_dispatcher_type='alltoall', "
+                assert self.moe_token_dispatcher_type in ("alltoall", "flex"), (
+                    "sequence_packing only supports moe_token_dispatcher_type in "
+                    "('alltoall', 'flex'), "
                     f"got '{self.moe_token_dispatcher_type}'"
                 )
+                if (
+                    self.moe_token_dispatcher_type == "flex"
+                    and self.moe_flex_dispatcher_backend == "hybridep"
+                    and not self.moe_hybridep_pad_uneven_dispatch_inputs
+                ):
+                    raise ValueError(
+                        "sequence_packing with HybridEP requires "
+                        "moe_hybridep_pad_uneven_dispatch_inputs=True because packed token "
+                        "counts can differ across dispatcher ranks"
+                    )
 
 
 @dataclass
