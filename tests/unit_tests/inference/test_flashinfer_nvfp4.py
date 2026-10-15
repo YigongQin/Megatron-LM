@@ -169,6 +169,28 @@ def test_flashinfer_forward_dispatches_to_nvfp4(monkeypatch):
     assert captured["out"] is None
 
 
+def test_refresh_derived_inference_weights_visits_all_modules(monkeypatch):
+    from megatron.core.resharding import refit
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    calls = []
+
+    class _Expert(torch.nn.Module):
+        def __init__(self, refreshed):
+            super().__init__()
+            self.refreshed = refreshed
+
+        def refresh_flashinfer_nvfp4_weights(self):
+            calls.append(self)
+            return self.refreshed
+
+    model = torch.nn.Sequential(_Expert(False), torch.nn.Linear(1, 1), _Expert(True))
+
+    assert refit.refresh_derived_inference_weights([model]) is True
+    assert calls == [model[0], model[2]]
+    assert refit.refresh_derived_inference_weights(torch.nn.Linear(1, 1)) is False
+
+
 def _blackwell_or_newer() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
 
@@ -545,6 +567,8 @@ class TestNVFP4MoELayer:
     @pytest.mark.parametrize("dispatcher", ["nccl", "nvls"])
     def test_nvfp4_moe_layer_refresh_tracks_bf16_weight_updates(self, dispatcher):
         """Simulates an optimizer step on a colocated model followed by a refresh."""
+        from megatron.core.resharding.refit import refresh_derived_inference_weights
+
         layer = self._make_layer(dispatcher)
         local_tokens = 32
         hidden_states = self._hidden_states(local_tokens, layer.config.hidden_size)
@@ -563,7 +587,7 @@ class TestNVFP4MoELayer:
                 stale, _ = layer(hidden_states.clone())
             torch.testing.assert_close(stale, before, atol=0, rtol=0)
 
-            assert layer.experts.refresh_flashinfer_nvfp4_weights() is True
+            assert refresh_derived_inference_weights(layer) is True
             with InferenceMode.active():
                 refreshed, _ = layer(hidden_states.clone())
 
@@ -575,6 +599,8 @@ class TestNVFP4MoELayer:
     @pytest.mark.parametrize("dispatcher", ["nccl", "nvls"])
     def test_nvfp4_moe_layer_cuda_graph_replay_tracks_inputs_and_refresh(self, dispatcher):
         """A captured layer replays like eager, and an in-place refresh reaches the graph."""
+        from megatron.core.resharding.refit import refresh_derived_inference_weights
+
         layer = self._make_layer(dispatcher)
         local_tokens = 32 if dispatcher == "nccl" else 17 + torch.distributed.get_rank()
         hidden_size = layer.config.hidden_size
@@ -607,7 +633,7 @@ class TestNVFP4MoELayer:
             before_refresh = graph_output.clone()
 
             layer.experts._fc1_weight.mul_(-1)
-            assert layer.experts.refresh_flashinfer_nvfp4_weights() is True
+            assert refresh_derived_inference_weights(layer) is True
             graph.replay()
             torch.testing.assert_close(graph_output, _eager(static_hidden), atol=0, rtol=0)
 

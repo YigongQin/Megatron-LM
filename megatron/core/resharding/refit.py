@@ -631,13 +631,32 @@ def reshard_model_weights(
     execute_reshard_plan(
         plan, src_core, tgt_core, service=service, group=group, transform=transform
     )
-    if tgt_core is not None and isinstance(transform, MXFP8ReshardTransform):
-        refreshed = False
-        for module in tgt_core.modules():
-            refresh = getattr(module, "refresh_flashinfer_mxfp8_weights", None)
-            if refresh is not None:
-                refreshed = bool(refresh()) or refreshed
-        if refreshed:
-            # Repacking is asynchronous. Synchronize before another stream replays graphs
-            # that read these derived weight buffers.
-            torch.cuda.synchronize()
+    if tgt_core is not None:
+        refresh_methods = ["refresh_flashinfer_nvfp4_weights"]
+        if isinstance(transform, MXFP8ReshardTransform):
+            refresh_methods.append("refresh_flashinfer_mxfp8_weights")
+        refresh_derived_inference_weights(tgt_core, refresh_methods)
+
+
+def refresh_derived_inference_weights(
+    model, refresh_methods: tuple[str, ...] | list[str] = ("refresh_flashinfer_nvfp4_weights",)
+) -> bool:
+    """Rebuild inference-only weight copies derived from the canonical model weights.
+
+    Must be called whenever the canonical weights change outside of a refit (e.g. a
+    colocated model shared between training and inference after an optimizer step).
+    Returns whether any derived weights were refreshed.
+    """
+    models = model if isinstance(model, (list, tuple)) else [model]
+    refreshed = False
+    for m in models:
+        for module in unwrap_model(m).modules():
+            for method_name in refresh_methods:
+                refresh = getattr(module, method_name, None)
+                if refresh is not None:
+                    refreshed = bool(refresh()) or refreshed
+    if refreshed:
+        # Repacking is asynchronous. Synchronize before another stream replays graphs
+        # that read these derived weight buffers.
+        torch.cuda.synchronize()
+    return refreshed

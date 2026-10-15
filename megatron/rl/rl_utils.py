@@ -62,7 +62,7 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.utils import get_pp_last_rank, is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
-from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.resharding.refit import refresh_derived_inference_weights, swap_model_weights
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import HuggingFaceTokenizer
 from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord
@@ -3184,6 +3184,11 @@ def megatron_rl_inference_mode(
                 ):
                     model_chunk.start_param_sync(force_sync=True)
 
+    if training_model is None:
+        # Inference-only quantized expert copies (e.g. per-token NVFP4) are derived from
+        # the shared BF16 weights and go stale after every optimizer step.
+        with nvtx_range("rl/refresh-derived-inference-weights", time=True):
+            refresh_derived_inference_weights(model)
 
     rotary_module = getattr(lang_module, "rotary_pos_emb", None)
     # Vanilla RotaryEmbedding module has lru_cache decorator which breaks RL training
