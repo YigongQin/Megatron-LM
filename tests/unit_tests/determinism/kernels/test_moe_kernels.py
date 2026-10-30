@@ -1124,8 +1124,9 @@ class TestMoEModules:
         )
 
     @pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
-    def test_inference_nvfp4_moe_layer_replays(self, gated):
+    def test_inference_nvfp4_moe_layer_replays(self, gated, monkeypatch):
         """Inference MoELayer through FlashInfer per-token NVFP4 squared-ReLU or SwiGLU experts."""
+        from megatron.core.inference import utils as inference_utils
         from megatron.core.inference.moe.flashinfer_nvfp4 import HAVE_FLASHINFER_ROUTED_NVFP4
         from megatron.core.inference.utils import InferenceMode
         from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
@@ -1133,6 +1134,11 @@ class TestMoEModules:
 
         if not HAVE_FLASHINFER_ROUTED_NVFP4 or torch.cuda.get_device_capability()[0] < 10:
             pytest.skip("per-token NVFP4 MoE needs FlashInfer >= 0.7.0 and Blackwell")
+        # Without flashinfer-jit-cache the modules it ships prebuilt JIT-compile instead;
+        # the layer's check only guards production against that compile time.
+        monkeypatch.setattr(
+            inference_utils, "check_flashinfer_jit_cache_installed", lambda **_: None
+        )
 
         class _InInferenceMode(torch.nn.Module):
             def __init__(self, module):

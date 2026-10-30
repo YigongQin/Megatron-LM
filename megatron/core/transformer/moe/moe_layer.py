@@ -458,17 +458,14 @@ class MoELayer(BaseMoELayer):
                     else:
                         require_flashinfer_routed_mxfp8()
                 if config.inference_moe_nvfp4_recipe is not None:
-                    # Per-token NVFP4 runs CuTe DSL JIT kernels, not the pre-compiled
-                    # CUTLASS kernels shipped in flashinfer-jit-cache.
                     require_flashinfer_routed_nvfp4()
-                else:
-                    # Verify that pre-compiled FlashInfer CUTLASS kernels are available
-                    # when using the FlashInfer backend. The flashinfer-jit-cache package
-                    # must be installed ahead of time to avoid a multi-minute JIT
-                    # compilation step at runtime.
-                    from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
+                # Every FlashInfer MoE path loads modules that flashinfer-jit-cache ships
+                # prebuilt (the CUTLASS and TRT-LLM fused-MoE launchers, TRT-LLM routing, and
+                # MXFP8 / FP4 quantization). It must be installed ahead of time to avoid a
+                # multi-minute JIT compilation step at runtime.
+                from megatron.core.inference.utils import check_flashinfer_jit_cache_installed
 
-                    check_flashinfer_jit_cache_installed()
+                check_flashinfer_jit_cache_installed()
             elif config.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
                 assert hasattr(torch.nn.functional, 'grouped_mm') or hasattr(
                     torch, '_grouped_mm'
